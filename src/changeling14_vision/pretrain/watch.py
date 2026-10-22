@@ -23,8 +23,6 @@ WATCHSET_SIZE = 24
 SCALE = 2
 CAPTION_H = 42
 GOOD, BAD = (70, 190, 90), (215, 70, 70)
-# Worn and in-hand overlays are hard to judge alone; the watch set shows the objects themselves.
-WORN = ("inhand-", "equipped-", "wielded-")
 
 
 def pick_watchset(index: dict, seed: int, n: int = WATCHSET_SIZE) -> list[dict]:
@@ -35,7 +33,7 @@ def pick_watchset(index: dict, seed: int, n: int = WATCHSET_SIZE) -> list[dict]:
     by_cat: dict[int, list[dict]] = {}
     for it in index["items"]:
         if (it["split"] == split and it["direction"] <= 0 and it["path"].endswith("_f0.png")
-                and not it["state"].startswith(WORN)):
+                and not it["worn"]):
             by_cat.setdefault(it["category"], []).append(it)
     for items in by_cat.values():
         rng.shuffle(items)

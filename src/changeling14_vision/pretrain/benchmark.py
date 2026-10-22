@@ -134,9 +134,9 @@ def benchmark(model_dir: Path, data: Path, progress: Progress | None = None, che
 
     if not speed_only:
         index = json.loads((Path(ckpt.get("out", model_dir)) / "index.json").read_text())
-        unseen = _predict(model, SpriteDataset(data, index, "unseen", train=False), dev, batch, progress,
+        unseen = _predict(model, SpriteDataset(data, index, "unseen", train=False, worn=False), dev, batch, progress,
                           "score unseen sheets")
-        newview = _predict(model, SpriteDataset(data, index, "newview", train=False), dev, batch, progress,
+        newview = _predict(model, SpriteDataset(data, index, "newview", train=False, worn=False), dev, batch, progress,
                            "score new views")
         report["complete"] = not progress.stop_requested
         report["unseen"], report["newview"] = _scores(unseen), _scores(newview)
@@ -148,7 +148,7 @@ def benchmark(model_dir: Path, data: Path, progress: Progress | None = None, che
                                 "top1": sum(r["cat_top5"][0] == c for r in rows) / len(rows)})
         report["per_category"] = sorted(per_cat, key=lambda c: -c["n"])
         if progress.run_dir and unseen:
-            items = SpriteDataset(data, index, "unseen", train=False).items
+            items = SpriteDataset(data, index, "unseen", train=False, worn=False).items
             wrong = sorted((i for i, r in enumerate(unseen) if r["cat_top5"][0] != r["cat"]),
                            key=lambda i: -unseen[i]["cat_conf"])[:24]
             draw_watchset(model, data, index, [items[i] for i in wrong], dev,

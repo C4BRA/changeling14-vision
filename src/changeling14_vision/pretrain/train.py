@@ -114,8 +114,9 @@ def _ignore_stop_signals(_worker_id: int) -> None:
 def _loader(ds, batch: int, shuffle: bool, workers: int, seed: int):
     g = torch.Generator()
     g.manual_seed(seed)
-    return torch.utils.data.DataLoader(ds, batch_size=batch, shuffle=shuffle, num_workers=workers,
-                                       drop_last=shuffle, generator=g, worker_init_fn=_ignore_stop_signals,
+    sampler = torch.utils.data.WeightedRandomSampler(ds.weights(), len(ds), generator=g) if shuffle else None
+    return torch.utils.data.DataLoader(ds, batch_size=batch, sampler=sampler, num_workers=workers,
+                                       drop_last=shuffle, worker_init_fn=_ignore_stop_signals,
                                        persistent_workers=workers > 0 and shuffle)
 
 
@@ -223,8 +224,10 @@ def train(opts: TrainOptions, progress: Progress | None = None) -> dict:
     print(f"train: {opts.size} encoder, {params / 1e6:.1f}M parameters, on {device}", flush=True)
 
     train_ds = SpriteDataset(opts.data, index, "train", train=True, seed=opts.seed)
-    unseen_ds = _subset(SpriteDataset(opts.data, index, "unseen", train=False, seed=opts.seed), EVAL_LIMIT, opts.seed)
-    newview_ds = _subset(SpriteDataset(opts.data, index, "newview", train=False, seed=opts.seed), EVAL_LIMIT, opts.seed)
+    unseen_ds = _subset(SpriteDataset(opts.data, index, "unseen", train=False, seed=opts.seed, worn=False),
+                        EVAL_LIMIT, opts.seed)
+    newview_ds = _subset(SpriteDataset(opts.data, index, "newview", train=False, seed=opts.seed, worn=False),
+                         EVAL_LIMIT, opts.seed)
     loader = _loader(train_ds, opts.batch, True, opts.workers, opts.seed + step)
     watch_items = pick_watchset(index, opts.seed, WATCHSET_SIZE)
 

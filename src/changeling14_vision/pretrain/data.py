@@ -14,6 +14,10 @@ Splits hold out whole sheets, never single images:
   unseen   10% of sheets, never trained on; scored on category
   newview  one image held out of each multi-image training state (another
            direction or animation frame); scored on state
+
+Held and worn overlays (inhand-*, equipped-*) are a third of the catalogue
+but alone are small fragments of a mob. They train at a quarter of the
+weight and are left out of the scores.
 """
 
 from __future__ import annotations
@@ -35,7 +39,11 @@ MIN_CATEGORY_SHEETS = 8
 # Screen HUD and editor-only art: out of scope for an in-world encoder.
 SKIP_PREFIXES = ("Interface/", "Markers/", "Actions/", "Parallaxes/", "LobbyScreens/", "Logo/",
                  "Tips/", "deprecated")
-INDEX_VERSION = 1
+INDEX_VERSION = 2
+# Overlays drawn on a mob (held or worn). Alone they are small fragments, so
+# they are sampled less often and left out of the headline scores.
+WORN = ("inhand-", "equipped-", "wielded-")
+WORN_WEIGHT = 0.25
 
 
 class DataError(Exception):
@@ -47,6 +55,10 @@ def category_of(sheet: str) -> str:
     if len(parts) >= 3:
         return f"{parts[0]}/{parts[1]}"
     return parts[0]
+
+
+def is_worn(state: str) -> bool:
+    return state.startswith(WORN) or "-inhand-" in state
 
 
 def _holdout(sheet: str, seed: int, fraction: float) -> bool:
@@ -65,6 +77,7 @@ def build_index(dataset: Path, seed: int = 14, unseen_fraction: float = 0.1, pro
         raise DataError(f"{dataset} has no images/ folder; rebuild M0 without --no-images")
     sheet_dirs: dict[str, int] = {}
     kept = []
+    opaque: set[str] = set()
     for i, r in enumerate(rows):
         if progress and i % 500 == 0:
             progress.update("index sprites", i, len(rows), f"{len(kept):,} usable")
@@ -77,6 +90,8 @@ def build_index(dataset: Path, seed: int = 14, unseen_fraction: float = 0.1, pro
                 alpha = img.getchannel("A") if img.mode == "RGBA" else None
                 if alpha is not None and alpha.getbbox() is None:
                     continue
+                if r["sheet"].startswith("Tiles/") and (alpha is None or alpha.getextrema()[0] == 255):
+                    opaque.add(r["path"])
         except OSError:
             continue
         sheet_dirs[f"{r['sheet']}|{r['state']}"] = max(sheet_dirs.get(f"{r['sheet']}|{r['state']}", 0),
@@ -105,7 +120,8 @@ def build_index(dataset: Path, seed: int = 14, unseen_fraction: float = 0.1, pro
                       "direction": r["direction"] if directions == 4 else -1,
                       "category": categories.index(cat_of[r["sheet"]]),
                       "state_id": state_ids.get(key, -1), "split": split,
-                      "w": r["width"], "h": r["height"]})
+                      "w": r["width"], "h": r["height"], "worn": is_worn(r["state"]),
+                      "opaque": r["path"] in opaque})
         if split == "train":
             by_state.setdefault(key, []).append(len(items) - 1)
     rng = random.Random(seed)
@@ -135,9 +151,8 @@ def load_or_build_index(dataset: Path, out: Path, seed: int = 14, progress=None)
 
 
 def floor_tiles(dataset: Path, index: dict, limit: int = 200) -> list[str]:
-    """Paths of real floor tile sprites to use as backgrounds."""
-    seen = [it["path"] for it in index["items"]
-            if it["sheet"].startswith("Tiles/") and it["w"] == 32 and it["h"] == 32]
+    """Paths of fully opaque 32x32 floor tile sprites to use as backgrounds."""
+    seen = [it["path"] for it in index["items"] if it.get("opaque") and it["w"] == 32 and it["h"] == 32]
     return seen[:limit]
 
 
@@ -196,13 +211,18 @@ def render(item: dict, dataset: Path, rng: random.Random, floors: list[str],
 class SpriteDataset:
     """Map-style dataset usable by torch's DataLoader (no torch import here)."""
 
-    def __init__(self, dataset: Path, index: dict, split: str, train: bool, seed: int = 14):
+    def __init__(self, dataset: Path, index: dict, split: str, train: bool, seed: int = 14,
+                 worn: bool = True):
         self.dataset = Path(dataset)
-        self.items = [it for it in index["items"] if it["split"] == split]
+        self.items = [it for it in index["items"] if it["split"] == split and (worn or not it["worn"])]
         self.floors = floor_tiles(self.dataset, index)
         self.train = train
         self.seed = seed
         self.epoch = 0
+
+    def weights(self) -> list[float]:
+        """Sampling weights for training: worn overlays less often."""
+        return [WORN_WEIGHT if it["worn"] else 1.0 for it in self.items]
 
     def __len__(self) -> int:
         return len(self.items)

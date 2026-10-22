@@ -82,7 +82,10 @@ whole-number zoom and nearest-neighbour rotation. It learns three things
 from the catalogue's own labels: the coarse category from the sheet's folder
 (`Objects/Tools`, `Structures/Doors`, 48 in all), the exact sprite (sheet and
 state), and the facing direction. Screen HUD art (`Interface/`, `Actions/`,
-`Markers/`, …) is left out.
+`Markers/`, …) is left out. Held and worn overlays (`inhand-*`,
+`equipped-*`) are a third of the catalogue but alone are small fragments of
+a mob, so they train at a quarter of the weight and are left out of the
+scores.
 
 What it holds out, so the scores mean something:
 
