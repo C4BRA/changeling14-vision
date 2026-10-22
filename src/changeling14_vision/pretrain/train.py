@@ -17,6 +17,7 @@ import json
 import math
 import os
 import random
+import signal
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -103,11 +104,18 @@ def lr_at(step: int, opts: TrainOptions) -> float:
     return opts.lr * (0.02 + 0.98 * 0.5 * (1 + math.cos(math.pi * t)))
 
 
+def _ignore_stop_signals(_worker_id: int) -> None:
+    # The app stops a job by signalling its whole process group. Workers must
+    # outlive that signal so the main process can save a checkpoint first.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
 def _loader(ds, batch: int, shuffle: bool, workers: int, seed: int):
     g = torch.Generator()
     g.manual_seed(seed)
     return torch.utils.data.DataLoader(ds, batch_size=batch, shuffle=shuffle, num_workers=workers,
-                                       drop_last=shuffle, generator=g,
+                                       drop_last=shuffle, generator=g, worker_init_fn=_ignore_stop_signals,
                                        persistent_workers=workers > 0 and shuffle)
 
 

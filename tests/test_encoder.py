@@ -138,3 +138,32 @@ def test_mlx_matches_torch_with_trained_batch_norms():
     tiles, pooled = mlx_enc(mx.array(x.numpy().transpose(0, 2, 3, 1)))
     assert np.abs(np.array(tiles) - ref_tiles.numpy()).max() < 1e-3
     assert np.abs(np.array(pooled) - ref_global.numpy()).max() < 1e-3
+
+
+def test_stop_signal_to_process_group_saves_checkpoint(tmp_path):
+    """The app sends SIGTERM to the whole process group, data workers included."""
+    import os
+    import signal
+    import subprocess
+    import sys
+    import time
+
+    data = _fake_dataset(tmp_path / "ds")
+    out, run = tmp_path / "model", tmp_path / "run"
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "changeling14_vision", "--run-dir", str(run), "train", "--data", str(data),
+         "--out", str(out), "--size", "nano", "--batch", "8", "--workers", "2", "--steps", "100000",
+         "--checkpoint-every", "100000", "--device", "cpu"],
+        start_new_session=True, env={**os.environ, "PYTHONPATH": str(Path(__file__).parents[1] / "src")})
+    deadline = time.time() + 240
+    while time.time() < deadline:
+        try:
+            if json.loads((run / "status.json").read_text()).get("step", 0) >= 3:
+                break
+        except (OSError, ValueError):
+            pass
+        time.sleep(0.5)
+    os.killpg(proc.pid, signal.SIGTERM)
+    assert proc.wait(timeout=30) == 143
+    assert json.loads((run / "status.json").read_text())["stage"] == "stopped"
+    assert torch.load(out / "latest.pt", weights_only=False)["step"] >= 3
