@@ -76,7 +76,7 @@ changeling14-vision benchmark --size tiny      # held-out scores and ms per fram
 changeling14-vision export --size tiny         # safetensors, ONNX, MLX, Core ML
 ```
 
-`train` draws each sprite from the M0 catalogue onto a 96×96 canvas at a
+`train` draws each sprite from the M0 catalogue onto a 64×64 canvas at a
 random spot, on a plain, noisy or real floor-tile background, with
 whole-number zoom and nearest-neighbour rotation. It learns three things
 from the catalogue's own labels: the coarse category from the sheet's folder

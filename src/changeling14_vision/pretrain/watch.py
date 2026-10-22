@@ -2,7 +2,7 @@
 checkpoint, so progress (and obvious failures) show at a glance in the app.
 
 The sprites come from sheets the model never trains on, one or two from each
-category. Each image is the 96x96 input at 2x, with a caption: the true
+category. Each image is the 64x64 input at 3x, with a caption: the true
 category, the predicted one with its confidence, and the training sprite the
 model thinks it looks most like. The frame is green when the category is right.
 """
@@ -20,7 +20,7 @@ from PIL import Image, ImageDraw, ImageFont
 from .data import CANVAS, Augment, floor_tiles, render
 
 WATCHSET_SIZE = 24
-SCALE = 2
+SCALE = 3
 CAPTION_H = 42
 GOOD, BAD = (70, 190, 90), (215, 70, 70)
 

@@ -53,11 +53,12 @@ class ConvBlock(nn.Module):
 
 
 class Downsample(nn.Module):
-    """2x2 stride-2 conv: non-overlapping, so it never blurs across the tile grid."""
+    """2x2 stride-2 conv: non-overlapping, so it never blurs across the tile grid.
+    With stride 1 it only changes the width (a 1x1 conv)."""
 
-    def __init__(self, cin: int, cout: int):
+    def __init__(self, cin: int, cout: int, stride: int = 2):
         super().__init__()
-        self.conv = nn.Conv2d(cin, cout, 2, stride=2, bias=False)
+        self.conv = nn.Conv2d(cin, cout, stride, stride=stride, bias=False)
         self.bn = nn.BatchNorm2d(cout)
 
     def forward(self, x):
@@ -97,15 +98,24 @@ class TransformerBlock(nn.Module):
 
 class Encoder(nn.Module):
     def __init__(self, conv=(24, 32, 64, 128, 192), conv_depths=(1, 2, 2, 2), dim=256, depth=10,
-                 heads=4, embed_dim: int = EMBED_DIM, size: str | None = None):
+                 heads=4, embed_dim: int = EMBED_DIM, size: str | None = None, stem_stride: int = 1):
         super().__init__()
+        if stem_stride not in (1, 2, 4):
+            raise ValueError("stem_stride must be 1, 2 or 4")
         self.config = dict(size=size, conv=tuple(conv), conv_depths=tuple(conv_depths), dim=dim,
-                           depth=depth, heads=heads, embed_dim=embed_dim, tile=TILE)
-        self.stem = nn.Sequential(nn.Conv2d(3, conv[0], 3, padding=1, bias=False),
-                                  nn.BatchNorm2d(conv[0]), nn.GELU())
+                           depth=depth, heads=heads, embed_dim=embed_dim, tile=TILE, stem_stride=stem_stride)
+        # stem_stride 1: 3x3 conv at full resolution. 2 or 4: a non-overlapping
+        # patch conv that still sees every pixel, and the first stages skip
+        # their downsample so the token grid stays one per 32 px square.
+        if stem_stride == 1:
+            stem = nn.Conv2d(3, conv[0], 3, padding=1, bias=False)
+        else:
+            stem = nn.Conv2d(3, conv[0], stem_stride, stride=stem_stride, bias=False)
+        self.stem = nn.Sequential(stem, nn.BatchNorm2d(conv[0]), nn.GELU())
+        skip = {1: 0, 2: 1, 4: 2}[stem_stride]
         stages = []
         for i, n in enumerate(conv_depths):
-            stages.append(nn.Sequential(Downsample(conv[i], conv[i + 1]),
+            stages.append(nn.Sequential(Downsample(conv[i], conv[i + 1], 1 if i < skip else 2),
                                         *[ConvBlock(conv[i + 1]) for _ in range(n)]))
         self.stages = nn.Sequential(*stages)
         self.tokenize = nn.Conv2d(conv[len(conv_depths)], dim, 2, stride=2)

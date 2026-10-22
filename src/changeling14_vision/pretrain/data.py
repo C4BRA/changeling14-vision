@@ -1,6 +1,6 @@
 """Single-sprite training samples from the M0 sprite catalogue.
 
-Each sample is one sprite cell drawn onto a 96x96 canvas (3x3 tiles) at a
+Each sample is one sprite cell drawn onto a 64x64 canvas (2x2 tiles) at a
 random offset, so the encoder learns that objects need not sit centred on a
 tile. Backgrounds are plain colours, noise or real floor tiles. Zoom is by
 whole numbers and rotation is nearest-neighbour, so pixel art stays crisp.
@@ -32,14 +32,14 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-CANVAS = 96
-MAX_SPRITE = 96
+CANVAS = 64
+MAX_SPRITE = 64
 MIN_SPRITE = 8
 MIN_CATEGORY_SHEETS = 8
 # Screen HUD and editor-only art: out of scope for an in-world encoder.
 SKIP_PREFIXES = ("Interface/", "Markers/", "Actions/", "Parallaxes/", "LobbyScreens/", "Logo/",
                  "Tips/", "deprecated")
-INDEX_VERSION = 2
+INDEX_VERSION = 3
 # Overlays drawn on a mob (held or worn). Alone they are small fragments, so
 # they are sampled less often and left out of the headline scores.
 WORN = ("inhand-", "equipped-", "wielded-")
@@ -184,7 +184,7 @@ def _background(rng: random.Random, dataset: Path, floors: list[str], aug: Augme
 
 def render(item: dict, dataset: Path, rng: random.Random, floors: list[str],
            aug: Augment | None = None) -> np.ndarray:
-    """One training canvas as a (3, 96, 96) float32 array in [0, 1]."""
+    """One training canvas as a (3, 64, 64) float32 array in [0, 1]."""
     aug = aug or Augment()
     with Image.open(dataset / item["path"]) as img:
         sprite = img.convert("RGBA")
