@@ -55,8 +55,10 @@ def _font():
         return ImageFont.load_default()
 
 
-def _short(text: str, width: int = 30) -> str:
-    return text if len(text) <= width else "…" + text[-(width - 1):]
+def _short(text: str, width: int = 30, keep_start: bool = False) -> str:
+    if len(text) <= width:
+        return text
+    return text[:width - 1] + "…" if keep_start else "…" + text[-(width - 1):]
 
 
 @torch.no_grad()
@@ -106,7 +108,7 @@ def draw_watchset(model, dataset: Path, index: dict, items: list[dict], device, 
             third = "has " + (", ".join(best) if best else "?")
         else:
             third = f"like {like.split('/', 1)[-1]}"
-        d.text((4, y + 24), _short(third), fill=(150, 150, 160), font=font)
+        d.text((4, y + 24), _short(third, keep_start=True), fill=(150, 150, 160), font=font)
         name = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(it["sheet"]).stem + "-" + it["state"])
         path = folder / f"{i:02d}-{name[:40]}.png"
         out.save(path)

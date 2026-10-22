@@ -131,8 +131,8 @@ def _render_md(r: dict) -> str:
                   f"| Exact sprite, new direction or frame | {n['n']:,} | {n.get('state_top1', 0):.1%} | "
                   f"{n.get('state_top5', 0):.1%} |",
                   f"| Facing direction (four-way sprites) | | {n.get('direction_top1', 0):.1%} | |", "",
-                  f"Naming unseen-sheet sprites from all entity texts ({u.get('text_n', 0):,} linked sprites): "
-                  f"top-1 {u.get('text_top1', 0):.1%}, top-5 {u.get('text_top5', 0):.1%}.", "",
+                  *([f"Naming unseen-sheet sprites from all entity texts ({u['text_n']:,} linked sprites): "
+                     f"top-1 {u['text_top1']:.1%}, top-5 {u['text_top5']:.1%}.", ""] if "text_n" in u else []),
                   f"Entity components on unseen sheets ({u.get('components_n', 0):,} linked sprites): "
                   f"F1 {u.get('components_f1', 0):.2f}, precision {u.get('components_precision', 0):.2f}, "
                   f"recall {u.get('components_recall', 0):.2f}.", "",
