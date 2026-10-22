@@ -78,10 +78,12 @@ changeling14-vision export --size tiny         # safetensors, ONNX, MLX, Core ML
 
 `train` draws each sprite from the M0 catalogue onto a 64×64 canvas at a
 random spot, on a plain, noisy or real floor-tile background, with
-whole-number zoom and nearest-neighbour rotation. It learns three things
-from the catalogue's own labels: the coarse category from the sheet's folder
-(`Objects/Tools`, `Structures/Doors`, 48 in all), the exact sprite (sheet and
-state), and the facing direction. Screen HUD art (`Interface/`, `Actions/`,
+whole-number zoom and nearest-neighbour rotation. It learns from the
+catalogue's own labels: the components of the entities that draw the sprite
+(Item, Clothing, MeleeWeapon, Door…; 41% of object sprites have an entity),
+the coarse category from the sheet's folder (`Objects/Tools`,
+`Structures/Doors`, 48 in all), the exact sprite (sheet and state), and the
+facing direction. Screen HUD art (`Interface/`, `Actions/`,
 `Markers/`, …) is left out. Held and worn overlays (`inhand-*`,
 `equipped-*`) are a third of the catalogue but alone are small fragments of
 a mob, so they train at a quarter of the weight and are left out of the
@@ -114,6 +116,8 @@ most confident mistakes into the watch set.
 format against PyTorch where its runtime is installed.
 
 Defaults: 20,000 steps of 128 sprites with AdamW and a cosine schedule.
+`--amp` turns on half precision on the GPU, which is often faster on Apple
+chips; check the loss still falls before relying on it.
 Memory peaked around 3 GB at batch 128 on CPU; pass `--batch 64` if the Air
 starts swapping.
 

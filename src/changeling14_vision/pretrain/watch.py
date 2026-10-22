@@ -3,8 +3,9 @@ checkpoint, so progress (and obvious failures) show at a glance in the app.
 
 The sprites come from sheets the model never trains on, one or two from each
 category. Each image is the 64x64 input at 3x, with a caption: the true
-category, the predicted one with its confidence, and the training sprite the
-model thinks it looks most like. The frame is green when the category is right.
+category, the predicted one with its confidence, and the entity components
+the model sees most surely (Item, MeleeWeapon, Door...). The frame is green
+when the category is right.
 """
 
 from __future__ import annotations
@@ -69,11 +70,13 @@ def draw_watchset(model, dataset: Path, index: dict, items: list[dict], device, 
         return []
     was_training = model.training
     model.eval()
-    cat_logits, state_logits, _ = model(torch.from_numpy(np.stack(canvases)).to(device))
+    out = model(torch.from_numpy(np.stack(canvases)).to(device))
     if was_training:
         model.train()
-    cat_p = cat_logits.softmax(1).cpu()
-    state_best = state_logits.argmax(1).cpu()
+    cat_p = out["category"].softmax(1).cpu()
+    state_best = out["state"].argmax(1).cpu()
+    comp_p = out["components"].sigmoid().cpu()
+    vocab = index.get("components") or []
     font = _font()
     paths = []
     for i, (it, arr) in enumerate(zip(items, canvases)):
@@ -90,7 +93,12 @@ def draw_watchset(model, dataset: Path, index: dict, items: list[dict], device, 
         d.text((4, y), _short(f"is   {index['categories'][it['category']]}"), fill=(200, 200, 200), font=font)
         d.text((4, y + 12), _short(f"says {index['categories'][int(pred)]} {float(conf):.0%}"),
                fill=GOOD if ok else BAD, font=font)
-        d.text((4, y + 24), _short(f"like {like.split('/', 1)[-1]}"), fill=(150, 150, 160), font=font)
+        if vocab:
+            best = [vocab[j] for j in comp_p[i].argsort(descending=True)[:3].tolist() if comp_p[i][j] > 0.5]
+            third = "has " + (", ".join(best) if best else "?")
+        else:
+            third = f"like {like.split('/', 1)[-1]}"
+        d.text((4, y + 24), _short(third), fill=(150, 150, 160), font=font)
         name = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(it["sheet"]).stem + "-" + it["state"])
         path = folder / f"{i:02d}-{name[:40]}.png"
         out.save(path)

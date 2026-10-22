@@ -60,7 +60,22 @@ def _fake_dataset(root: Path) -> Path:
     (root / "catalogue").mkdir(parents=True, exist_ok=True)
     with open(root / "catalogue" / "images.jsonl", "w") as f:
         f.writelines(json.dumps(r) + "\n" for r in rows)
+    entities, links = [], []
+    for s in sheets[:-1]:
+        name = Path(s).stem
+        comps = ["Sprite", "Item", "Tool"] if "Tools" in s else ["Sprite", "Door", "Airlock"]
+        entities.append({"id": name, "components": comps})
+        links += [{"sheet": s, "state": st, "entities": [{"entity": name, "role": "sprite"}]} for st in ("icon", "open")]
+    with open(root / "catalogue" / "entities.jsonl", "w") as f:
+        f.writelines(json.dumps(e) + "\n" for e in entities)
+    with open(root / "catalogue" / "sprite_links.jsonl", "w") as f:
+        f.writelines(json.dumps(link) + "\n" for link in links)
     return root
+
+
+@pytest.fixture(autouse=True)
+def small_component_vocab(monkeypatch):
+    monkeypatch.setattr("changeling14_vision.pretrain.data.MIN_COMPONENT_STATES", 5)
 
 
 def test_index_holds_out_whole_sheets(tmp_path):
@@ -71,6 +86,12 @@ def test_index_holds_out_whole_sheets(tmp_path):
     assert all(len(v) == 1 for v in by_sheet.values())   # a sheet is wholly in or out
     assert index["counts"].get("unseen") and index["counts"].get("newview")
     assert all(it["state_id"] == -1 for it in index["items"] if it["split"] == "unseen")
+    # Sprite is on every linked sprite, so it says nothing and is not a label.
+    assert index["components"] == ["Airlock", "Door", "Item", "Tool"]
+    floor = next(it for it in index["items"] if it["sheet"] == "Tiles/floor.rsi")
+    assert floor["components"] is None
+    wrench = next(it for it in index["items"] if it["sheet"] == "Objects/Tools/tool0.rsi")
+    assert [index["components"][c] for c in wrench["components"]] == ["Item", "Tool"]
 
 
 def test_train_resume_benchmark_export(tmp_path):
@@ -98,6 +119,7 @@ def test_train_resume_benchmark_export(tmp_path):
     report = json.loads((run2 / "benchmark.json").read_text())
     assert report["step"] == 8 and report["speed"]["ms_median"] > 0
     assert "category_top1" in report["unseen"] and (out / "benchmarks" / "step-0000008.md").exists()
+    assert "components_f1" in report["unseen"]
 
     run3 = tmp_path / "run3"
     assert main(["--run-dir", str(run3), "export", "--out", str(out), "--size", "nano",

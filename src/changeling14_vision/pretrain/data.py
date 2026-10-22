@@ -6,6 +6,9 @@ tile. Backgrounds are plain colours, noise or real floor tiles. Zoom is by
 whole numbers and rotation is nearest-neighbour, so pixel art stays crisp.
 
 Labels, all from the catalogue, never hand-made:
+  components what the entities that draw the sprite are made of (Item,
+             Clothing, MeleeWeapon, Door, Edible...): several per sprite,
+             only for sprites an entity draws
   category   coarse group from the sheet's folder, e.g. Objects/Tools
   state      the (sheet, state) pair: the sprite's exact visual identity
   direction  0-3 for four-direction states, else ignored
@@ -39,7 +42,11 @@ MIN_CATEGORY_SHEETS = 8
 # Screen HUD and editor-only art: out of scope for an in-world encoder.
 SKIP_PREFIXES = ("Interface/", "Markers/", "Actions/", "Parallaxes/", "LobbyScreens/", "Logo/",
                  "Tips/", "deprecated")
-INDEX_VERSION = 3
+INDEX_VERSION = 4
+# A component becomes a label when at least this many linked sprites have it,
+# and at most this share of them (Sprite, Physics and the like say nothing).
+MIN_COMPONENT_STATES = 30
+MAX_COMPONENT_SHARE = 0.6
 # Overlays drawn on a mob (held or worn). Alone they are small fragments, so
 # they are sampled less often and left out of the headline scores.
 WORN = ("inhand-", "equipped-", "wielded-")
@@ -128,10 +135,43 @@ def build_index(dataset: Path, seed: int = 14, unseen_fraction: float = 0.1, pro
     for idxs in by_state.values():
         if len(idxs) >= 2:
             items[rng.choice(idxs)]["split"] = "newview"
+    components = _attach_components(dataset, items)
     counts = Counter(it["split"] for it in items)
     return {"version": INDEX_VERSION, "dataset": str(dataset), "seed": seed,
-            "categories": categories, "states": train_states,
+            "categories": categories, "states": train_states, "components": components,
             "counts": dict(counts), "items": items}
+
+
+def _attach_components(dataset: Path, items: list[dict]) -> list[str]:
+    """Give each sprite the components of the entities that draw it (M0's
+    sprite_links and entities), as indices into the returned vocabulary.
+    Sprites no entity draws get None and are left out of that loss."""
+    cat = dataset / "catalogue"
+    if not (cat / "sprite_links.jsonl").is_file() or not (cat / "entities.jsonl").is_file():
+        for it in items:
+            it["components"] = None
+        return []
+    entity_components = {}
+    for line in (cat / "entities.jsonl").open(encoding="utf-8"):
+        e = json.loads(line)
+        entity_components[e["id"]] = e.get("components") or []
+    per_state: dict[tuple[str, str], set[str]] = {}
+    for line in (cat / "sprite_links.jsonl").open(encoding="utf-8"):
+        link = json.loads(line)
+        comps: set[str] = set()
+        for user in link["entities"]:
+            comps.update(entity_components.get(user["entity"], ()))
+        if comps:
+            per_state[(link["sheet"], link["state"])] = comps
+    linked = {(it["sheet"], it["state"]) for it in items} & per_state.keys()
+    freq = Counter(c for key in linked for c in per_state[key])
+    vocab = sorted(c for c, n in freq.items()
+                   if n >= MIN_COMPONENT_STATES and n <= MAX_COMPONENT_SHARE * max(1, len(linked)))
+    ids = {c: i for i, c in enumerate(vocab)}
+    for it in items:
+        comps = per_state.get((it["sheet"], it["state"]))
+        it["components"] = sorted(ids[c] for c in comps if c in ids) if comps is not None else None
+    return vocab
 
 
 def load_or_build_index(dataset: Path, out: Path, seed: int = 14, progress=None) -> dict:
@@ -216,6 +256,7 @@ class SpriteDataset:
         self.dataset = Path(dataset)
         self.items = [it for it in index["items"] if it["split"] == split and (worn or not it["worn"])]
         self.floors = floor_tiles(self.dataset, index)
+        self.n_components = len(index.get("components", ()))
         self.train = train
         self.seed = seed
         self.epoch = 0
@@ -236,4 +277,8 @@ class SpriteDataset:
             rng = random.Random(self.seed * 1_000_003 + i)   # same canvas every evaluation
             aug = Augment(zoom=0.0, rotate=0.0)
         x = render(item, self.dataset, rng, self.floors, aug)
-        return x, item["category"], item["state_id"], item["direction"]
+        comps = np.zeros(max(1, self.n_components), dtype=np.float32)
+        if item.get("components"):
+            comps[item["components"]] = 1.0
+        return {"x": x, "category": item["category"], "state": item["state_id"], "direction": item["direction"],
+                "components": comps, "has_components": item.get("components") is not None}

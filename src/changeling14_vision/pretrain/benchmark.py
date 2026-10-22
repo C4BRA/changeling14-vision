@@ -59,18 +59,26 @@ def _predict(model, ds, device, batch, progress, stage):
     loader = _loader(ds, batch, False, 0, 0)
     rows = []
     done = 0
-    for x, cat, state, direction in loader:
+    for batch in loader:
         if progress.stop_requested:
             break
-        c, s, d = model(x.to(device))
+        out = model(batch["x"].to(device))
+        c, s, d = out["category"], out["state"], out["direction"]
+        cat, state, direction = batch["category"], batch["state"], batch["direction"]
         cp = c.softmax(1).cpu()
         top5 = c.topk(min(5, c.shape[1]), 1).indices.cpu()
         stop5 = s.topk(min(5, s.shape[1]), 1).indices.cpu()
         dirs = d.argmax(1).cpu()
+        comp_pred = (out["components"] > 0).cpu()
+        comp_true = batch["components"] > 0.5
         for i in range(len(cat)):
-            rows.append({"cat": int(cat[i]), "cat_top5": top5[i].tolist(), "cat_conf": float(cp[i].max()),
-                         "state": int(state[i]), "state_top5": stop5[i].tolist(),
-                         "dir": int(direction[i]), "dir_pred": int(dirs[i])})
+            row = {"cat": int(cat[i]), "cat_top5": top5[i].tolist(), "cat_conf": float(cp[i].max()),
+                   "state": int(state[i]), "state_top5": stop5[i].tolist(),
+                   "dir": int(direction[i]), "dir_pred": int(dirs[i])}
+            if batch["has_components"][i]:
+                p, t = comp_pred[i], comp_true[i]
+                row["comp"] = (int((p & t).sum()), int((p & ~t).sum()), int((~p & t).sum()))
+            rows.append(row)
         done += len(cat)
         progress.update(stage, done, len(ds))
     return rows
@@ -85,6 +93,12 @@ def _scores(rows) -> dict:
     if st:
         out["state_top1"] = sum(r["state_top5"][0] == r["state"] for r in st) / len(st)
         out["state_top5"] = sum(r["state"] in r["state_top5"] for r in st) / len(st)
+    cr = [r["comp"] for r in rows if "comp" in r]
+    if cr:
+        tp, fp, fn = (sum(x[k] for x in cr) for k in range(3))
+        p, r_ = tp / max(1, tp + fp), tp / max(1, tp + fn)
+        out.update(components_n=len(cr), components_precision=p, components_recall=r_,
+                   components_f1=2 * p * r_ / max(1e-9, p + r_))
     dr = [r for r in rows if r["dir"] >= 0]
     if dr:
         out["direction_top1"] = sum(r["dir_pred"] == r["dir"] for r in dr) / len(dr)
@@ -107,6 +121,9 @@ def _render_md(r: dict) -> str:
                   f"| Exact sprite, new direction or frame | {n['n']:,} | {n.get('state_top1', 0):.1%} | "
                   f"{n.get('state_top5', 0):.1%} |",
                   f"| Facing direction (four-way sprites) | | {n.get('direction_top1', 0):.1%} | |", "",
+                  f"Entity components on unseen sheets ({u.get('components_n', 0):,} linked sprites): "
+                  f"F1 {u.get('components_f1', 0):.2f}, precision {u.get('components_precision', 0):.2f}, "
+                  f"recall {u.get('components_recall', 0):.2f}.", "",
                   "## Unseen sheets by category", "| Category | Images | Top-1 |", "|---|---|---|"]
         lines += [f"| {c['category']} | {c['n']:,} | {c['top1']:.1%} |" for c in r["per_category"]]
         lines.append("")
@@ -173,6 +190,7 @@ def benchmark(model_dir: Path, data: Path, progress: Progress | None = None, che
     summary = f"{s['ms_median']:.1f} ms/frame"
     if "unseen" in report:
         summary += (f", unseen category {report['unseen'].get('category_top1', 0):.1%}, "
+                    f"components F1 {report['unseen'].get('components_f1', 0):.2f}, "
                     f"new-view state {report['newview'].get('state_top1', 0):.1%}")
     progress.update("done" if report["complete"] else "stopped", message=summary, eta_seconds=0, force=True)
     return report

@@ -13,6 +13,7 @@ folder per checkpoint (docs/run-folder.md).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
@@ -53,21 +54,24 @@ class TrainOptions:
     device: str = "auto"
     seed: int = 14
     fresh: bool = False
+    amp: bool = False                  # half precision on MPS/CUDA (bfloat16 on CPU)
 
 
 class PretrainModel(nn.Module):
     """The encoder plus the stage-1 heads. Only the encoder is exported."""
 
-    def __init__(self, encoder: Encoder, n_categories: int, n_states: int):
+    def __init__(self, encoder: Encoder, n_categories: int, n_states: int, n_components: int = 0):
         super().__init__()
         self.encoder = encoder
         self.category = nn.Linear(EMBED_DIM, n_categories)
         self.state = nn.Linear(EMBED_DIM, n_states)
         self.direction = nn.Linear(EMBED_DIM, 4)
+        self.components = nn.Linear(EMBED_DIM, max(1, n_components))
 
-    def forward(self, x):
+    def forward(self, x) -> dict:
         _tiles, g = self.encoder(x)
-        return self.category(g), self.state(g), self.direction(g)
+        return {"category": self.category(g), "state": self.state(g), "direction": self.direction(g),
+                "components": self.components(g)}
 
 
 def pick_device(name: str = "auto") -> torch.device:
@@ -81,7 +85,8 @@ def pick_device(name: str = "auto") -> torch.device:
 
 
 def build_model(size: str, index: dict) -> PretrainModel:
-    return PretrainModel(build_encoder(size), len(index["categories"]), len(index["states"]))
+    return PretrainModel(build_encoder(size), len(index["categories"]), len(index["states"]),
+                         len(index.get("components", ())))
 
 
 def load_checkpoint(path: Path, map_location="cpu") -> dict:
@@ -92,9 +97,25 @@ def model_from_checkpoint(path: Path) -> tuple[PretrainModel, dict]:
     """Rebuild the model from a latest.pt or checkpoints/step-N.pt file."""
     ckpt = load_checkpoint(path)
     model = PretrainModel(Encoder(**{k: v for k, v in ckpt["encoder_config"].items() if k != "tile"}),
-                          ckpt["n_categories"], ckpt["n_states"])
+                          ckpt["n_categories"], ckpt["n_states"], ckpt.get("n_components", 0))
     model.load_state_dict(ckpt["model"])
     return model, ckpt
+
+
+def _mixed_precision(device: torch.device, enabled: bool):
+    """(autocast context factory, grad scaler or None). Off by default: half
+    precision is usually faster on Apple and NVIDIA GPUs, but check that the
+    loss still falls before relying on it."""
+    if not enabled:
+        return contextlib.nullcontext, None
+    dtype = torch.bfloat16 if device.type == "cpu" else torch.float16
+    scaler = None
+    if dtype == torch.float16:
+        try:
+            scaler = torch.amp.GradScaler(device.type)
+        except (RuntimeError, TypeError, ValueError):
+            scaler = None
+    return (lambda: torch.autocast(device_type=device.type, dtype=dtype)), scaler
 
 
 def lr_at(step: int, opts: TrainOptions) -> float:
@@ -126,14 +147,21 @@ def _subset(ds: SpriteDataset, limit: int, seed: int) -> SpriteDataset:
     return ds
 
 
-def _losses(outputs, cat, state, direction):
-    cat_logits, state_logits, dir_logits = outputs
-    loss_cat = F.cross_entropy(cat_logits, cat, label_smoothing=0.1)
-    loss_state = F.cross_entropy(state_logits, state, ignore_index=-1, label_smoothing=0.1) \
-        if (state >= 0).any() else cat_logits.sum() * 0
-    loss_dir = F.cross_entropy(dir_logits, direction, ignore_index=-1) \
-        if (direction >= 0).any() else cat_logits.sum() * 0
-    return loss_cat + loss_state + 0.5 * loss_dir, (loss_cat, loss_state, loss_dir)
+def _to(batch: dict, device) -> dict:
+    return {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+
+
+def _losses(out: dict, b: dict):
+    zero = out["category"].sum() * 0
+    loss_cat = F.cross_entropy(out["category"], b["category"], label_smoothing=0.1)
+    loss_state = F.cross_entropy(out["state"], b["state"], ignore_index=-1, label_smoothing=0.1) \
+        if (b["state"] >= 0).any() else zero
+    loss_dir = F.cross_entropy(out["direction"], b["direction"], ignore_index=-1) \
+        if (b["direction"] >= 0).any() else zero
+    m = b["has_components"]
+    loss_comp = F.binary_cross_entropy_with_logits(out["components"][m], b["components"][m]) * 10 \
+        if m.any() else zero
+    return loss_cat + loss_state + 0.5 * loss_dir + loss_comp, (loss_cat, loss_state, loss_dir, loss_comp)
 
 
 @torch.no_grad()
@@ -142,11 +170,21 @@ def evaluate(model: PretrainModel, loader, device, stop=lambda: False) -> dict:
     model.eval()
     n_cat = n_state = n_dir = 0
     cat1 = cat5 = st1 = st5 = dir1 = 0
-    for x, cat, state, direction in loader:
+    tp = fp = fn = 0
+    for batch in loader:
         if stop():
             break
-        x, cat, state, direction = x.to(device), cat.to(device), state.to(device), direction.to(device)
-        c, s, d = model(x)
+        b = _to(batch, device)
+        cat, state, direction = b["category"], b["state"], b["direction"]
+        out = model(b["x"])
+        c, s, d = out["category"], out["state"], out["direction"]
+        m = b["has_components"]
+        if m.any():
+            pred = out["components"][m] > 0
+            truth = b["components"][m] > 0.5
+            tp += (pred & truth).sum().item()
+            fp += (pred & ~truth).sum().item()
+            fn += (~pred & truth).sum().item()
         top = c.topk(min(5, c.shape[1]), dim=1).indices
         cat1 += (top[:, 0] == cat).sum().item()
         cat5 += (top == cat[:, None]).any(dim=1).sum().item()
@@ -169,6 +207,10 @@ def evaluate(model: PretrainModel, loader, device, stop=lambda: False) -> dict:
         out.update(state_top1=st1 / n_state, state_top5=st5 / n_state)
     if n_dir:
         out.update(direction_top1=dir1 / n_dir)
+    if tp + fp + fn:
+        precision, recall = tp / max(1, tp + fp), tp / max(1, tp + fn)
+        out.update(components_precision=precision, components_recall=recall,
+                   components_f1=2 * precision * recall / max(1e-9, precision + recall))
     return out
 
 
@@ -220,6 +262,7 @@ def train(opts: TrainOptions, progress: Progress | None = None) -> dict:
         (out / "config.json").write_text(json.dumps(
             {**{k: str(v) if isinstance(v, Path) else v for k, v in asdict(opts).items()},
              "version": __version__}, indent=2))
+    autocast, scaler = _mixed_precision(device, opts.amp)
     params = count_parameters(model.encoder)
     print(f"train: {opts.size} encoder, {params / 1e6:.1f}M parameters, on {device}", flush=True)
 
@@ -242,13 +285,15 @@ def train(opts: TrainOptions, progress: Progress | None = None) -> dict:
         name = f"step-{step:07d}"
         state = {"step": step, "model": model.state_dict(), "optim": optim.state_dict(),
                  "encoder_config": model.encoder.config, "n_categories": len(index["categories"]),
-                 "n_states": len(index["states"]), "out": str(out), "version": __version__,
+                 "n_states": len(index["states"]), "n_components": len(index.get("components", ())),
+                 "out": str(out), "version": __version__,
                  "options": {k: str(v) if isinstance(v, Path) else v for k, v in asdict(opts).items()}}
         _save(latest, state)
         _save(out / "checkpoints" / f"{name}.pt", {k: v for k, v in state.items() if k != "optim"})
         row = {"step": step, "time": time.time(), "reason": reason, "loss": avg_loss(),
                "unseen_category_top1": scores["unseen"].get("category_top1"),
                "unseen_category_top5": scores["unseen"].get("category_top5"),
+               "unseen_components_f1": scores["unseen"].get("components_f1"),
                "newview_state_top1": scores["newview"].get("state_top1"),
                "newview_state_top5": scores["newview"].get("state_top5"),
                "newview_direction_top1": scores["newview"].get("direction_top1"),
@@ -278,18 +323,27 @@ def train(opts: TrainOptions, progress: Progress | None = None) -> dict:
     if step == 0:
         last_row = checkpoint("start")
     while step < opts.steps and not stopped:
-        for x, cat, state, direction in loader:
+        for batch in loader:
             if progress.stop_requested or (opts.minutes and time.time() - started > opts.minutes * 60):
                 stopped = True
                 break
-            x, cat, state, direction = x.to(device), cat.to(device), state.to(device), direction.to(device)
+            b = _to(batch, device)
             for group in optim.param_groups:
                 group["lr"] = lr_at(step, opts)
-            loss, _parts = _losses(model(x), cat, state, direction)
+            with autocast():
+                out_ = model(b["x"])
+            loss, _parts = _losses({k: v.float() for k, v in out_.items()}, b)
             optim.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optim.step()
+            if scaler:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optim)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optim)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optim.step()
             step += 1
             window.append(loss.item())
             del window[:-100]
@@ -311,7 +365,8 @@ def train(opts: TrainOptions, progress: Progress | None = None) -> dict:
     if last_row["unseen_category_top1"] is None:
         message = f"stopped at step {step:,}; checkpoint saved, run again to resume"
     else:
-        message = (f"unseen category {last_row['unseen_category_top1']:.1%}, "
-                   f"new-view state {last_row['newview_state_top1'] or 0:.1%}")
+        message = (f"unseen: category {last_row['unseen_category_top1']:.1%}, "
+                   f"components F1 {last_row['unseen_components_f1'] or 0:.2f}; "
+                   f"new-view sprite {last_row['newview_state_top1'] or 0:.1%}")
     progress.update("done" if done else "stopped", step, opts.steps, message, eta_seconds=0, force=True)
     return {"complete": done, "step": step, "last": last_row}
