@@ -58,6 +58,7 @@ class TrainOptions:
     fresh: bool = False
     amp: bool = False                  # half precision on MPS/CUDA (bfloat16 on CPU)
     text_model: str | None = DEFAULT_TEXT_MODEL   # None: no text matching
+    rich_text: bool = False            # average name, suffix, folder and component phrases (text.py)
     ema: float = 0.999                 # decay of the weight average that is scored and saved
     optimizer: str = "adamw"           # adamw (cosine schedule) or schedulefree (no schedule)
 
@@ -510,8 +511,12 @@ def train(opts: TrainOptions, progress: Progress | None = None) -> dict:
     if opts.text_model:
         try:
             progress.update("embed text", message=opts.text_model, force=True)
-            text = TextTable(build_text_table(opts.data, out, model_name=opts.text_model, progress=progress))
-            print(f"train: {len(text.texts):,} entity texts from {text.model}", flush=True)
+            text = TextTable(build_text_table(opts.data, out, model_name=opts.text_model, progress=progress,
+                                              rich=opts.rich_text))
+            print(f"train: {len(text.texts):,} entity texts from {text.model}"
+                  f"{' with folder and component phrases' if text.rich else ''}", flush=True)
+            if text.rich != opts.rich_text:
+                print("train: this model folder keeps the text it started with; --fresh rebuilds it", flush=True)
         except ImportError:
             print("train: sentence-transformers is not installed, so training runs without text matching "
                   '(pip install -e ".[text]")', flush=True)

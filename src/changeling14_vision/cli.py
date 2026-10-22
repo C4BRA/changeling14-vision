@@ -94,7 +94,8 @@ def cmd_train(args) -> int:
                         steps=args.steps, batch=args.batch, lr=args.lr, workers=args.workers,
                         checkpoint_every=args.checkpoint_every, checkpoint_minutes=args.checkpoint_minutes,
                         optimizer=args.optimizer, minutes=args.minutes, device=args.device, seed=args.seed, fresh=args.fresh,
-                        amp=args.amp, text_model=None if args.no_text else args.text_model)
+                        amp=args.amp, text_model=None if args.no_text else args.text_model,
+                        rich_text=args.rich_text)
     progress = Progress(args.run_dir)
     progress.catch_stop()
     print(f"train: sprites from {opts.data}, model folder {opts.out}", flush=True)
@@ -177,6 +178,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--text-model", default="sentence-transformers/all-MiniLM-L6-v2",
                    help="sentence model for matching sprites to entity names (downloaded once)")
     p.add_argument("--no-text", action="store_true", help="train without text matching")
+    p.add_argument("--rich-text", action="store_true",
+                   help="also describe each item by its suffix, folders and components (new models only)")
     p.add_argument("--amp", action="store_true",
                    help="half precision on the GPU: often faster on Apple chips; check the loss still falls")
     p.add_argument("--seed", type=int, default=14)

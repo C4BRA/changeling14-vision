@@ -88,11 +88,19 @@ starts, so similar meanings sit close together, and the encoder learns to
 land each sprite near its own text (SigLIP's loss). That is what lets a new
 sprite of a familiar kind be named, and later lets anyone ask the encoder
 questions in plain words. `--no-text` turns it off; `--text-model` picks
-another sentence model, which means training again. Alongside text: the components of the entities that draw the sprite
+another sentence model, which means training again. `--rich-text` (new
+models only) also describes each item by its editor suffix, its prototype
+folders and a short checked list of components ("bucket, objects, tools";
+"bucket: holds items inside, an item you can pick up"), averaged into one
+vector; `COMPONENT_WORDS` in `pretrain/text.py` is the whole hand-written
+part. Alongside text: the components of the entities that draw the sprite
 (Item, Clothing, MeleeWeapon, Door…; 41% of object sprites have an entity),
 the coarse category from the sheet's folder (`Objects/Tools`,
-`Structures/Doors`, 48 in all), the exact sprite (sheet and state), and the
-facing direction. Screen HUD art (`Interface/`, `Actions/`,
+`Structures/Doors`, 48 in all), the exact sprite (learned by contrast: another
+direction or frame of the same sprite has to land nearest), and the facing
+direction. Half of the training pictures are 2×2 canvases of four small
+sprites, each 32-pixel tile learning its own category and name, so the tile
+outputs learn to tell neighbours apart. Screen HUD art (`Interface/`, `Actions/`,
 `Markers/`, …) is left out. Held and worn overlays (`inhand-*`,
 `equipped-*`) are a third of the catalogue but alone are small fragments of
 a mob, so they train at a quarter of the weight and are left out of the

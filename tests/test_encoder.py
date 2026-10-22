@@ -341,3 +341,32 @@ def test_schedulefree_trains_resumes_and_benchmarks(tmp_path):
     # A different optimiser can't continue this model.
     with pytest.raises(SystemExit, match="schedulefree"):
         main(args[:-1] + ["adamw", "--steps", "6"])
+
+
+def test_rich_text_uses_only_catalogue_facts(tmp_path):
+    from changeling14_vision.pretrain import text as text_mod
+    bucket = {"id": "Bucket", "name": "bucket", "description": "It's a boring old bucket.", "suffix": "Full",
+              "source": "Entities/Objects/Tools/bucket.yml",
+              "components": ["Item", "Clothing", "Edible", "Storage", "SomethingNew"]}
+    assert text_mod.entity_phrases(bucket) == [
+        "bucket. It's a boring old bucket.", "bucket, full", "bucket, objects, tools",
+        "bucket: holds items inside, an item you can pick up"]
+    assert text_mod.entity_phrases({"id": "X", "name": "", "components": ["Item"]}) == []
+    assert text_mod._words("OuterClothing") == "outer clothing"
+
+    root = tmp_path / "ds" / "catalogue"
+    root.mkdir(parents=True)
+    plain = dict(bucket, id="Bucket2", suffix=None, components=[])
+    (root / "entities.jsonl").write_text(json.dumps(bucket) + "\n" + json.dumps(plain) + "\n")
+    seen = []
+
+    def embed(texts, batch=256):
+        seen.extend(texts)
+        return np.stack([np.random.default_rng(len(t)).normal(size=8) for t in texts])
+
+    path = text_mod.build_text_table(tmp_path / "ds", tmp_path / "m", embed=embed, model_name="fake", rich=True)
+    table = text_mod.TextTable(path)
+    # Both share the shown text, so they share one row; every phrase is embedded once.
+    assert table.texts == ["bucket. It's a boring old bucket."] and table.rich
+    assert table.rows_for(["Bucket", "Bucket2"]) == [0] and len(seen) == len(set(seen)) == 4
+    assert abs(np.linalg.norm(table.vectors[0]) - 1) < 1e-2
