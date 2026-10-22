@@ -39,6 +39,19 @@ PROTOTYPES = """
     - map: [ "enum.SomeVisuals.Layer" ]
 
 - type: entity
+  parent: BaseItem
+  id: DarkWrench
+  name: dark wrench
+  components:
+  - type: Sprite
+    sprite: Objects/Tools/wrench.rsi
+    layers:
+    - state: icon
+      color: "#808080"
+    - state: spin
+      visible: false
+
+- type: entity
   id: NcThing
   name: nc thing
   components:
@@ -134,6 +147,17 @@ def test_build_catalogue(repo, tmp_path):
     assert credits[1][:2] == ["Objects/Tools/wrench.rsi", "CC-BY-SA-3.0"]
     excluded = list(csv.reader(open(out / "excluded.csv")))
     assert excluded[1][2] == "non-commercial license"
+
+    # Whole-item looks: one untinted layer reuses the cut image; tinted layers are stacked.
+    looks = [json.loads(line) for line in (out / "catalogue" / "entity_images.jsonl").read_text().splitlines()]
+    plain = next(look for look in looks if "Wrench" in look["entities"])
+    assert not plain["composite"] and plain["path"] == "images/Objects/Tools/wrench/icon/d0_f0.png"
+    assert "PipeA" in plain["entities"]
+    dark = next(look for look in looks if look["entities"] == ["DarkWrench"])
+    assert dark["composite"] and dark["tinted"] and dark["layers"] == ["Objects/Tools/wrench.rsi|icon"]
+    # The hidden spin layer is left out, and the tint multiplies the icon's (0, 100, 200).
+    assert Image.open(out / dark["path"]).getpixel((5, 5)) == (0, 50, 100, 255)
+    assert not any("NcThing" in look["entities"] for look in looks)
 
     manifest = json.loads((out / "manifest.json").read_text())
     assert "catalogue/entities.jsonl" in manifest["files"]

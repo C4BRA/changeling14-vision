@@ -185,6 +185,8 @@ class SpriteRef:
     map: tuple[str, ...] = ()
     visible: bool = True
     texture: str | None = None
+    color: str | None = None         # the layer's tint, e.g. "#3f3f3f" or "red"
+    sprite_color: str | None = None  # the whole Sprite's tint, applied to every layer
 
 
 def _rsi_path(value: object) -> str | None:
@@ -196,12 +198,17 @@ def _rsi_path(value: object) -> str | None:
     return value
 
 
+def _color(value: object) -> str | None:
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
 def sprite_refs(entity: Entity) -> list[SpriteRef]:
     refs: list[SpriteRef] = []
     sprite = entity.components.get("Sprite")
     base_rsi = None
     if sprite is not None:
         base_rsi = _rsi_path(sprite.get("sprite") or sprite.get("rsi"))
+        sprite_color = _color(sprite.get("color"))
         layers = sprite.get("layers")
         if isinstance(layers, list) and layers:
             for i, layer in enumerate(layers):
@@ -213,11 +220,12 @@ def sprite_refs(entity: Entity) -> list[SpriteRef]:
                     mapping = (mapping,)
                 refs.append(SpriteRef(
                     "layer", rsi, layer.get("state"), i, tuple(str(m) for m in mapping),
-                    str(layer.get("visible", "true")).lower() != "false", _rsi_path(layer.get("texture"))))
+                    str(layer.get("visible", "true")).lower() != "false", _rsi_path(layer.get("texture")),
+                    _color(layer.get("color")), sprite_color))
         elif base_rsi or sprite.get("state"):
             # A top-level state is only drawn when there are no layers; with layers,
             # an inherited `state: icon` is ignored by the game too.
-            refs.append(SpriteRef("sprite", base_rsi, sprite.get("state")))
+            refs.append(SpriteRef("sprite", base_rsi, sprite.get("state"), sprite_color=sprite_color))
     icon = entity.components.get("Icon")
     if icon is not None:
         refs.append(SpriteRef("icon", _rsi_path(icon.get("sprite")), icon.get("state")))

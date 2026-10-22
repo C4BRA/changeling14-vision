@@ -23,6 +23,14 @@ Splits hold out whole sheets, never single images:
 Held and worn overlays (inhand-*, equipped-*) are a third of the catalogue
 but alone are small fragments of a mob. They train at a quarter of the
 weight and are left out of the scores.
+
+Names and components go to pictures of whole items. With M0's
+entity_images.jsonl, those are each entity's stacked and tinted look (one
+extra image per look) plus the cut images of items that are a single
+untinted layer (every direction and frame). A lone layer of a bigger item,
+such as a lamp glow or a welder flame, still trains category and state but
+carries no name. Older catalogues without that file name every cut image an
+entity links to, as before.
 """
 
 from __future__ import annotations
@@ -44,7 +52,7 @@ MIN_CATEGORY_SHEETS = 8
 # Screen HUD and editor-only art: out of scope for an in-world encoder.
 SKIP_PREFIXES = ("Interface/", "Markers/", "Actions/", "Parallaxes/", "LobbyScreens/", "Logo/",
                  "Tips/", "deprecated")
-INDEX_VERSION = 5
+INDEX_VERSION = 6
 MAX_TEXTS = 8           # text rows kept per sprite for scoring
 # A component becomes a label when at least this many linked sprites have it,
 # and at most this share of them (Sprite, Physics and the like say nothing).
@@ -53,6 +61,7 @@ MAX_COMPONENT_SHARE = 0.6
 # Overlays drawn on a mob (held or worn). Alone they are small fragments, so
 # they are sampled less often and left out of the headline scores.
 WORN = ("inhand-", "equipped-", "wielded-")
+WORN_INSIDE = ("-inhand-", "-equipped-", "-wielded-")   # e.g. soles-equipped-FEET
 WORN_WEIGHT = 0.25
 
 
@@ -68,7 +77,7 @@ def category_of(sheet: str) -> str:
 
 
 def is_worn(state: str) -> bool:
-    return state.startswith(WORN) or "-inhand-" in state
+    return state.startswith(WORN) or any(part in state for part in WORN_INSIDE)
 
 
 def _holdout(sheet: str, seed: int, fraction: float) -> bool:
@@ -138,17 +147,36 @@ def build_index(dataset: Path, seed: int = 14, unseen_fraction: float = 0.1, pro
     for idxs in by_state.values():
         if len(idxs) >= 2:
             items[rng.choice(idxs)]["split"] = "newview"
-    components = _attach_components(dataset, items)
+    looks = _read_looks(dataset)
+    for look in looks or ():
+        if not look.get("composite") or look["sheet"] not in cat_of:
+            continue
+        if not (MIN_SPRITE <= look["width"] <= MAX_SPRITE and MIN_SPRITE <= look["height"] <= MAX_SPRITE):
+            continue
+        items.append({"path": look["path"], "sheet": look["sheet"], "state": "@" + Path(look["path"]).stem,
+                      "direction": -1, "category": categories.index(cat_of[look["sheet"]]), "state_id": -1,
+                      "split": "unseen" if look["sheet"] in unseen else "train",
+                      "w": look["width"], "h": look["height"], "worn": False, "opaque": False,
+                      "look": True, "look_entities": sorted(look["entities"])})
+    components = _attach_components(dataset, items, looks)
     counts = Counter(it["split"] for it in items)
     return {"version": INDEX_VERSION, "dataset": str(dataset), "seed": seed,
             "categories": categories, "states": train_states, "components": components,
             "counts": dict(counts), "items": items}
 
 
-def _attach_components(dataset: Path, items: list[dict]) -> list[str]:
-    """Give each sprite the components of the entities that draw it (M0's
-    sprite_links and entities), as indices into the returned vocabulary.
-    Sprites no entity draws get None and are left out of that loss."""
+def _read_looks(dataset: Path) -> list[dict] | None:
+    path = dataset / "catalogue" / "entity_images.jsonl"
+    if not path.is_file():
+        return None
+    return [json.loads(line) for line in path.open(encoding="utf-8")]
+
+
+def _attach_components(dataset: Path, items: list[dict], looks: list[dict] | None = None) -> list[str]:
+    """Give each sprite the entities it shows and their components (M0's
+    entities, and entity_images or sprite_links), as indices into the
+    returned vocabulary. Sprites showing no whole entity get None and are
+    left out of that loss."""
     cat = dataset / "catalogue"
     if not (cat / "sprite_links.jsonl").is_file() or not (cat / "entities.jsonl").is_file():
         for it in items:
@@ -163,12 +191,25 @@ def _attach_components(dataset: Path, items: list[dict]) -> list[str]:
     users: dict[tuple[str, str], list[str]] = {}
     for line in (cat / "sprite_links.jsonl").open(encoding="utf-8"):
         link = json.loads(line)
-        comps: set[str] = set()
-        for user in link["entities"]:
-            comps.update(entity_components.get(user["entity"], ()))
-        users[(link["sheet"], link["state"])] = sorted({u["entity"] for u in link["entities"]})
+        key = (link["sheet"], link["state"])
+        # With looks, a sprite link names a cut image only when it is worn or
+        # held (whole-item pictures come from the looks below).
+        if looks is not None and not is_worn(link["state"]):
+            continue
+        users[key] = sorted({u["entity"] for u in link["entities"]})
+    for look in looks or ():
+        if not look.get("composite"):
+            key = (look["sheet"], look["state"])
+            users[key] = sorted(set(users.get(key, [])) | set(look["entities"]))
+    for it in items:
+        if it.get("look"):
+            users[(it["sheet"], it["state"])] = it.pop("look_entities")
+    for key, ents in users.items():
+        comps = set()
+        for e in ents:
+            comps.update(entity_components.get(e, ()))
         if comps:
-            per_state[(link["sheet"], link["state"])] = comps
+            per_state[key] = comps
     linked = {(it["sheet"], it["state"]) for it in items} & per_state.keys()
     freq = Counter(c for key in linked for c in per_state[key])
     vocab = sorted(c for c, n in freq.items()
@@ -189,6 +230,9 @@ def load_or_build_index(dataset: Path, out: Path, seed: int = 14, progress=None)
         index = json.loads(path.read_text())
         if index.get("version") == INDEX_VERSION:
             return index
+        if (out / "latest.pt").is_file():
+            raise DataError(f"{out} was trained with an older label format, so its checkpoints don't fit "
+                            "the new labels. Start a new model (or pass --fresh to start this one over).")
     index = build_index(dataset, seed=seed, progress=progress)
     out.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name("index.json.tmp")

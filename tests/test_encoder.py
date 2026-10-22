@@ -95,6 +95,28 @@ def test_index_holds_out_whole_sheets(tmp_path):
     assert [index["components"][c] for c in wrench["components"]] == ["Item", "Tool"]
 
 
+def test_names_go_to_whole_items(tmp_path):
+    from changeling14_vision.pretrain.data import is_worn
+    data = _fake_dataset(tmp_path / "ds")
+    look = Path("images/_entities/tool0.png")
+    (data / look).parent.mkdir(parents=True)
+    Image.new("RGBA", (32, 32), (60, 60, 60, 255)).save(data / look)
+    with open(data / "catalogue" / "entity_images.jsonl", "w") as f:
+        f.write(json.dumps({"path": look.as_posix(), "composite": True, "sheet": "Objects/Tools/tool0.rsi",
+                            "state": "icon", "width": 32, "height": 32, "entities": ["tool0"]}) + "\n")
+        f.write(json.dumps({"path": "images/Structures/Doors/door0/icon/d0_f0.png", "composite": False,
+                            "sheet": "Structures/Doors/door0.rsi", "state": "icon", "entities": ["door0"]}) + "\n")
+    index = build_index(data)
+    named = {(it["sheet"], it["state"]): it["entities"] for it in index["items"]}
+    # The stacked look carries the name; tool0's lone layers no longer do.
+    assert named[("Objects/Tools/tool0.rsi", "@tool0")] == ["tool0"]
+    assert named[("Objects/Tools/tool0.rsi", "icon")] == []
+    # A one-layer item keeps its name on every direction of that state, not on its other states.
+    assert named[("Structures/Doors/door0.rsi", "icon")] == ["door0"]
+    assert named[("Structures/Doors/door0.rsi", "open")] == []
+    assert is_worn("soles-equipped-FEET") and is_worn("equipped-HELMET") and not is_worn("icon-unshaded")
+
+
 def test_train_resume_benchmark_export(tmp_path):
     data = _fake_dataset(tmp_path / "ds")
     out, run = tmp_path / "model", tmp_path / "run"

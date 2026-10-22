@@ -8,6 +8,9 @@ checkout, and writes everything into one output folder:
   catalogue/images.jsonl         one line per cut image
   catalogue/entities.jsonl       one line per entity: name, parent chain, sprite refs
   catalogue/sprite_links.jsonl   one line per (sheet, state): the entities that draw it
+  catalogue/entity_images.jsonl  one line per distinct look of an entity on the floor: its
+                                 layers stacked and tinted (images/_entities/), or the cut
+                                 image itself when that is one untinted layer
   credits.md, credits.csv        every sheet used, with license and copyright
   excluded.csv                   every sheet left out, with the reason
   report.json, report.md         counts, and how many sprite links came out clean
@@ -30,6 +33,7 @@ from pathlib import Path
 from .. import __version__
 from ..progress import Progress
 from . import licenses
+from .compose import Composer
 from .prototypes import Entity, SpriteRef, load_entities, resolve, sprite_refs
 from .rsi import Sheet, cut_state, find_sheets, read_sheet
 
@@ -135,6 +139,43 @@ def classify(ref: SpriteRef, sheets: dict[str, Sheet], included: set[str]) -> st
     return "clean"
 
 
+def _compose_entities(out: Path, entity_refs: dict[str, list[tuple[SpriteRef, str]]],
+                      sheets: dict[str, Sheet], progress: Progress) -> int:
+    """Write catalogue/entity_images.jsonl: one row per distinct look, with
+    every entity that looks exactly like that. Returns the number of rows."""
+    composer = Composer(sheets)
+    simple: dict[tuple[str, str], list[str]] = defaultdict(list)
+    stacked: dict[bytes, dict] = {}
+    ids = sorted(entity_refs)
+    for i, entity_id in enumerate(ids):
+        if i % 500 == 0:
+            progress.update("compose items", i, len(ids), "stacking layers and colours")
+        look = composer.compose(entity_refs[entity_id])
+        if look is None:
+            continue
+        if look.simple:
+            simple[look.layers[0]].append(entity_id)
+            continue
+        key = hashlib.sha256(look.image.tobytes() + repr(look.image.size).encode()).digest()
+        if key not in stacked:
+            rel = Path("images") / "_entities" / f"{entity_id}.png"
+            (out / rel).parent.mkdir(parents=True, exist_ok=True)
+            look.image.save(out / rel)
+            sheet, state = look.layers[0]
+            stacked[key] = {"path": rel.as_posix(), "composite": True, "sheet": sheet, "state": state,
+                            "layers": [f"{a}|{b}" for a, b in look.layers], "tinted": look.tinted,
+                            "width": look.image.width, "height": look.image.height, "entities": []}
+        stacked[key]["entities"].append(entity_id)
+    rows = list(stacked.values())
+    for (sheet, state), users in sorted(simple.items()):
+        rel = Path("images") / sheet[:-len(".rsi")] / state / "d0_f0.png"
+        if (out / rel).is_file():
+            rows.append({"path": rel.as_posix(), "composite": False, "sheet": sheet, "state": state,
+                         "layers": [f"{sheet}|{state}"], "tinted": False, "entities": users})
+    _jsonl(out / "catalogue" / "entity_images.jsonl", rows)
+    return len(rows)
+
+
 def build(opts: Options, progress: Progress | None = None) -> dict:
     progress = progress or Progress(None)
     started = time.time()
@@ -170,10 +211,13 @@ def build(opts: Options, progress: Progress | None = None) -> dict:
     ref_status = Counter()
     entity_rows = []
     drawable = clean_entities = 0
+    entity_refs: dict[str, list[tuple[SpriteRef, str]]] = {}
     for entity in sorted(entities.values(), key=lambda e: e.id):
         rows = []
         for ref in sprite_refs(entity):
             status = classify(ref, sheets, included)
+            if not entity.abstract:
+                entity_refs.setdefault(entity.id, []).append((ref, status))
             if not entity.abstract:
                 ref_status[status] += 1
             row = {k: v for k, v in asdict(ref).items() if v not in (None, (), True) or k in ("rsi", "state")}
@@ -239,6 +283,11 @@ def build(opts: Options, progress: Progress | None = None) -> dict:
                         eta_seconds=rate * (len(ordered) - done))
     _jsonl(cat / "images.jsonl", image_rows)
 
+    # 3b. Whole entities, layers stacked and tinted ----------------------------
+    looks = 0
+    if opts.images and not stopped:
+        looks = _compose_entities(out, entity_refs, sheets, progress)
+
     # 4. Sheets, credits, exclusions -----------------------------------------
     used_sheets = {sheet for (sheet, _state) in links}
     _jsonl(cat / "sheets.jsonl", (
@@ -285,6 +334,7 @@ def build(opts: Options, progress: Progress | None = None) -> dict:
                      "concrete_with_clean_world_sprite": clean_entities},
         "sprite_refs": dict(ref_status.most_common()),
         "sprite_links": len(links),
+        "entity_looks": looks,
         "problems": len(problems),
         "seconds": round(time.time() - started, 1),
     }
@@ -333,6 +383,8 @@ def render_report(r: dict) -> str:
               "## Images",
               f"- {r['images']['cut']:,} images cut (every state, direction and animation frame).",
               f"- {r['images']['state_errors']:,} states could not be cut (see problems.txt).",
+              f"- {r.get('entity_looks', 0):,} item looks: each entity's layers stacked with their colours, "
+              "as it appears on the floor (catalogue/entity_images.jsonl).",
               "",
               "## Entities",
               f"- {e['total']:,} entity prototypes: {e['concrete']:,} concrete, {e['abstract']:,} abstract.",

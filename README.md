@@ -40,6 +40,7 @@ Those two paths are the defaults. It takes about a minute and writes:
 | `catalogue/images.jsonl` | one line per cut image |
 | `catalogue/entities.jsonl` | every entity: name, description, parent chain, components, sprite refs with a status |
 | `catalogue/sprite_links.jsonl` | for each (sheet, state), the entities that draw it |
+| `catalogue/entity_images.jsonl` | each item as it looks on the floor: its layers stacked with their prototype colours (`images/_entities/`), or the cut image when the item is one untinted layer |
 | `credits.md`, `credits.csv` | every sheet used, with its license and copyright |
 | `excluded.csv` | every sheet left out, and why |
 | `report.md`, `report.json` | counts, and how many sprite links came out clean |
@@ -96,6 +97,11 @@ facing direction. Screen HUD art (`Interface/`, `Actions/`,
 `equipped-*`) are a third of the catalogue but alone are small fragments of
 a mob, so they train at a quarter of the weight and are left out of the
 scores.
+
+Names and components go only to pictures of whole items: the stacked,
+coloured looks above, and every frame of items that are a single layer. A
+lone layer of a bigger item (a lamp glow, a welder flame, the trinkets on
+a jumpsuit) still trains category and sprite but carries no name.
 
 What it holds out, so the scores mean something:
 
