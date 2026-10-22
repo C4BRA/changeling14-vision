@@ -106,8 +106,12 @@ What it holds out, so the scores mean something:
 
 The model folder (default `~/Desktop/SS13-14/changeling14-models/sprite-pretrain-<size>`)
 holds `latest.pt`, every checkpoint under `checkpoints/`, `metrics.jsonl`,
-and the label index. Running `train` again resumes from `latest.pt`;
-`--fresh` starts over. `--minutes 120` stops cleanly after two hours, so a
+and the label index. A model folder belongs to the catalogue it was started
+on (its `config.json` records it), because its labels come from that
+catalogue. `train --out <folder>` resumes from `latest.pt` with that
+catalogue and size, and `benchmark`/`export --out <folder>` read them too.
+Pointing `--data` at another catalogue is refused; use a new folder, or
+`--fresh` to start this one over. `--minutes 120` stops cleanly after two hours, so a
 long run can be split across nights. Stopping from the app saves a
 checkpoint first.
 

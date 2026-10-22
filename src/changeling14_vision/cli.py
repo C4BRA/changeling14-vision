@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -31,7 +32,35 @@ def _need_torch() -> bool:
 
 
 def _model_dir(args) -> Path:
-    return Path(args.out or Path(DEFAULT_MODELS) / f"sprite-pretrain-{args.size}").expanduser()
+    return Path(args.out or Path(DEFAULT_MODELS) / f"sprite-pretrain-{args.size or 'tiny'}").expanduser()
+
+
+def _folder_config(model_dir: Path) -> dict:
+    """The options a model folder was started with (train writes config.json once)."""
+    try:
+        return json.loads((model_dir / "config.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _resolve_model_args(args, resuming: bool = True) -> str | None:
+    """Fill --data and --size from the model folder, so `--out <model>` alone is
+    enough. Returns an error message when --data names another catalogue than
+    the one the folder was trained on (its labels would not match)."""
+    model_dir = _model_dir(args)
+    cfg = _folder_config(model_dir) if resuming else {}
+    if hasattr(args, "data"):
+        recorded = cfg.get("data")
+        if args.data is None:
+            args.data = recorded or DEFAULT_OUT
+        elif recorded and resuming and (model_dir / "latest.pt").exists() and \
+                Path(args.data).expanduser().resolve() != Path(recorded).expanduser().resolve():
+            return (f"{model_dir} was trained on the catalogue in {recorded}, not {args.data}. "
+                    "Its labels come from that catalogue, so pick another model folder for this one, "
+                    "or pass --fresh to start this folder over.")
+    if args.size is None:
+        args.size = cfg.get("size") or "tiny"
+    return None
 
 
 def cmd_sprites(args) -> int:
@@ -57,7 +86,11 @@ def cmd_train(args) -> int:
     from .pretrain.data import DataError
     from .pretrain.train import TrainOptions, train
 
-    opts = TrainOptions(data=Path(args.data).expanduser(), out=_model_dir(args), size=args.size,
+    problem = _resolve_model_args(args, resuming=not args.fresh)
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return 2
+    opts = TrainOptions(data=Path(args.data).expanduser().resolve(), out=_model_dir(args), size=args.size,
                         steps=args.steps, batch=args.batch, lr=args.lr, workers=args.workers,
                         checkpoint_every=args.checkpoint_every, checkpoint_minutes=args.checkpoint_minutes,
                         minutes=args.minutes, device=args.device, seed=args.seed, fresh=args.fresh,
@@ -78,6 +111,7 @@ def cmd_benchmark(args) -> int:
         return 2
     from .pretrain.benchmark import benchmark
 
+    _resolve_model_args(args)
     progress = Progress(args.run_dir)
     progress.catch_stop()
     report = benchmark(_model_dir(args), Path(args.data).expanduser(), progress,
@@ -90,6 +124,7 @@ def cmd_export(args) -> int:
         return 2
     from .export import FORMATS, export
 
+    _resolve_model_args(args)
     formats = [f.strip() for f in args.formats.split(",") if f.strip()]
     unknown = [f for f in formats if f not in FORMATS]
     if unknown:
@@ -116,13 +151,14 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(func=cmd_sprites)
 
     def model_args(p, size_default="tiny"):
-        p.add_argument("--size", default=size_default, choices=["nano", "tiny", "small", "base"],
-                       help=f"encoder size (default {size_default})")
+        p.add_argument("--size", choices=["nano", "tiny", "small", "base"],
+                       help=f"encoder size (default: the model folder's, else {size_default})")
         p.add_argument("--out", help=f"model folder (default {DEFAULT_MODELS}/sprite-pretrain-<size>)")
         p.add_argument("--device", default="auto", help="auto (MPS, then CUDA, then CPU), mps, cuda or cpu")
 
     p = sub.add_parser("train", help="stage 1: single-sprite pretraining on the M0 catalogue (resumes)")
-    p.add_argument("--data", default=DEFAULT_OUT, help=f"M0 sprite catalogue (default {DEFAULT_OUT})")
+    p.add_argument("--data", help=f"M0 sprite catalogue (default: the one the model folder was trained on, "
+                                  f"else {DEFAULT_OUT}); a model folder keeps its catalogue for life")
     model_args(p)
     p.add_argument("--steps", type=int, default=20000, help="total optimizer steps (default 20000)")
     p.add_argument("--batch", type=int, default=128)
@@ -142,7 +178,8 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(func=cmd_train)
 
     p = sub.add_parser("benchmark", help="score a checkpoint on held-out sprites, and time it")
-    p.add_argument("--data", default=DEFAULT_OUT, help=f"M0 sprite catalogue (default {DEFAULT_OUT})")
+    p.add_argument("--data", help=f"M0 sprite catalogue (default: the one the model folder was trained on, "
+                                  f"else {DEFAULT_OUT})")
     model_args(p)
     p.add_argument("--checkpoint", help="a .pt file (default: the model folder's latest.pt)")
     p.add_argument("--speed-only", action="store_true", help="only time the encoder; no data needed")

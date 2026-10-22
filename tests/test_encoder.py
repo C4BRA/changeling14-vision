@@ -138,6 +138,32 @@ def test_train_resume_benchmark_export(tmp_path):
             assert entry["max_diff"] < 1e-3, (fmt, entry)
 
 
+def test_model_folder_keeps_its_catalogue(tmp_path, capsys):
+    data = _fake_dataset(tmp_path / "ds")
+    out = tmp_path / "model"
+    common = ["--batch", "8", "--workers", "0", "--checkpoint-every", "100", "--device", "cpu", "--no-text"]
+    assert main(["train", "--data", str(data), "--out", str(out), "--size", "nano", "--steps", "2"] + common) == 0
+    cfg = json.loads((out / "config.json").read_text())
+    assert cfg["data"] == str(data.resolve()) and cfg["size"] == "nano"
+
+    # --out alone continues the model on its own catalogue and size.
+    assert main(["train", "--out", str(out), "--steps", "3"] + common) == 0
+    assert torch.load(out / "latest.pt", weights_only=False)["step"] == 3
+
+    # Another catalogue would scramble the labels: refused unless the folder starts over.
+    other = _fake_dataset(tmp_path / "other")
+    capsys.readouterr()
+    assert main(["train", "--data", str(other), "--out", str(out), "--steps", "4"] + common) == 2
+    assert "trained on the catalogue" in capsys.readouterr().err
+    assert main(["train", "--data", str(other), "--out", str(out), "--size", "nano", "--steps", "1",
+                 "--fresh"] + common) == 0
+    assert json.loads((out / "config.json").read_text())["data"] == str(other.resolve())
+
+    run = tmp_path / "bench"
+    assert main(["--run-dir", str(run), "benchmark", "--out", str(out), "--device", "cpu"]) == 0
+    assert json.loads((run / "benchmark.json").read_text())["size"] == "nano"
+
+
 def test_mlx_matches_torch_with_trained_batch_norms():
     mx = pytest.importorskip("mlx.core")
     from changeling14_vision.export import mlx_weights

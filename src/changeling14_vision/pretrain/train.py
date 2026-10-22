@@ -281,8 +281,10 @@ def train(opts: TrainOptions, progress: Progress | None = None) -> dict:
     out.mkdir(parents=True, exist_ok=True)
     (out / "checkpoints").mkdir(exist_ok=True)
     latest = out / "latest.pt"
-    if opts.fresh and latest.exists():
-        latest.unlink()
+    if opts.fresh:
+        # Labels and texts come from the catalogue, which may be another one now.
+        for name in ("latest.pt", "index.json", "text.npz"):
+            (out / name).unlink(missing_ok=True)
     _seed_everything(opts.seed)
 
     progress.update("index sprites", message="reading the sprite catalogue", force=True)
