@@ -1,0 +1,178 @@
+"""Score a pretraining checkpoint on every held-out sprite, and time the encoder.
+
+Writes benchmarks/step-N.json and .md next to the checkpoint, and
+benchmark.json, benchmark.md, per_category.csv plus a "mistakes" watch-set
+folder (the most confident wrong answers) into the run folder.
+"""
+
+from __future__ import annotations
+
+import csv
+import json
+import platform
+import resource
+import statistics
+import sys
+import time
+from pathlib import Path
+
+import torch
+
+from ..model.encoder import count_parameters
+from ..progress import Progress, _write_json_atomic
+from .data import SpriteDataset
+from .train import _loader, model_from_checkpoint, pick_device
+from .watch import draw_watchset
+
+SPEED_SIZE = (480, 480)     # 15 x 15 tiles, the plan's reference frame
+
+
+def _sync(device: torch.device) -> None:
+    if device.type == "mps":
+        torch.mps.synchronize()
+    elif device.type == "cuda":
+        torch.cuda.synchronize()
+
+
+@torch.no_grad()
+def time_encoder(encoder, device, size=SPEED_SIZE, runs: int = 30) -> dict:
+    encoder.eval()
+    x = torch.rand(1, 3, *size, device=device)
+    for _ in range(5):
+        encoder(x)
+    _sync(device)
+    times = []
+    for _ in range(runs):
+        t = time.perf_counter()
+        encoder(x)
+        _sync(device)
+        times.append((time.perf_counter() - t) * 1000)
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    peak_mb = peak / 1e6 if sys.platform == "darwin" else peak / 1e3   # bytes on macOS, KB on Linux
+    return {"frame": list(size), "device": str(device), "ms_median": statistics.median(times),
+            "ms_p90": sorted(times)[int(len(times) * 0.9) - 1], "process_peak_rss_mb": round(peak_mb),
+            "machine": f"{platform.system()} {platform.machine()}"}
+
+
+@torch.no_grad()
+def _predict(model, ds, device, batch, progress, stage):
+    loader = _loader(ds, batch, False, 0, 0)
+    rows = []
+    done = 0
+    for x, cat, state, direction in loader:
+        if progress.stop_requested:
+            break
+        c, s, d = model(x.to(device))
+        cp = c.softmax(1).cpu()
+        top5 = c.topk(min(5, c.shape[1]), 1).indices.cpu()
+        stop5 = s.topk(min(5, s.shape[1]), 1).indices.cpu()
+        dirs = d.argmax(1).cpu()
+        for i in range(len(cat)):
+            rows.append({"cat": int(cat[i]), "cat_top5": top5[i].tolist(), "cat_conf": float(cp[i].max()),
+                         "state": int(state[i]), "state_top5": stop5[i].tolist(),
+                         "dir": int(direction[i]), "dir_pred": int(dirs[i])})
+        done += len(cat)
+        progress.update(stage, done, len(ds))
+    return rows
+
+
+def _scores(rows) -> dict:
+    out = {"n": len(rows)}
+    if rows:
+        out["category_top1"] = sum(r["cat_top5"][0] == r["cat"] for r in rows) / len(rows)
+        out["category_top5"] = sum(r["cat"] in r["cat_top5"] for r in rows) / len(rows)
+    st = [r for r in rows if r["state"] >= 0]
+    if st:
+        out["state_top1"] = sum(r["state_top5"][0] == r["state"] for r in st) / len(st)
+        out["state_top5"] = sum(r["state"] in r["state_top5"] for r in st) / len(st)
+    dr = [r for r in rows if r["dir"] >= 0]
+    if dr:
+        out["direction_top1"] = sum(r["dir_pred"] == r["dir"] for r in dr) / len(dr)
+    return out
+
+
+def _render_md(r: dict) -> str:
+    lines = [f"# Benchmark: {r['size']} encoder, step {r['step']:,}", "",
+             f"Checkpoint `{r['checkpoint']}`, {r['parameters'] / 1e6:.1f}M parameters.", ""]
+    s = r["speed"]
+    lines += ["## Speed", f"- {s['ms_median']:.1f} ms median ({s['ms_p90']:.1f} ms p90) per "
+              f"{s['frame'][1]}x{s['frame'][0]} frame on {s['device']} ({s['machine']}).",
+              f"- Process peak memory {s['process_peak_rss_mb']:,} MB.", ""]
+    if "unseen" in r:
+        u, n = r["unseen"], r["newview"]
+        lines += ["## Held-out sprites",
+                  "| Test | Images | Top-1 | Top-5 |", "|---|---|---|---|",
+                  f"| Category of sprites from unseen sheets | {u['n']:,} | {u.get('category_top1', 0):.1%} | "
+                  f"{u.get('category_top5', 0):.1%} |",
+                  f"| Exact sprite, new direction or frame | {n['n']:,} | {n.get('state_top1', 0):.1%} | "
+                  f"{n.get('state_top5', 0):.1%} |",
+                  f"| Facing direction (four-way sprites) | | {n.get('direction_top1', 0):.1%} | |", "",
+                  "## Unseen sheets by category", "| Category | Images | Top-1 |", "|---|---|---|"]
+        lines += [f"| {c['category']} | {c['n']:,} | {c['top1']:.1%} |" for c in r["per_category"]]
+        lines.append("")
+    if not r["complete"]:
+        lines += ["**Stopped early; scores are partial.**", ""]
+    return "\n".join(lines)
+
+
+def benchmark(model_dir: Path, data: Path, progress: Progress | None = None, checkpoint: str | None = None,
+              device: str = "auto", speed_only: bool = False, batch: int = 128) -> dict:
+    progress = progress or Progress(None)
+    ckpt_path = Path(checkpoint).expanduser() if checkpoint else model_dir / "latest.pt"
+    if not ckpt_path.is_file():
+        raise SystemExit(f"no checkpoint at {ckpt_path}; train first")
+    progress.update("load", message=str(ckpt_path), force=True)
+    model, ckpt = model_from_checkpoint(ckpt_path)
+    dev = pick_device(device)
+    model.to(dev).eval()
+    step = ckpt["step"]
+    report = {"checkpoint": str(ckpt_path), "step": step, "size": ckpt["encoder_config"]["size"],
+              "parameters": count_parameters(model.encoder), "time": time.time(), "complete": True}
+
+    progress.update("time encoder", message=f"{SPEED_SIZE[1]}x{SPEED_SIZE[0]} frames on {dev}", force=True)
+    report["speed"] = time_encoder(model.encoder, dev)
+
+    if not speed_only:
+        index = json.loads((Path(ckpt.get("out", model_dir)) / "index.json").read_text())
+        unseen = _predict(model, SpriteDataset(data, index, "unseen", train=False), dev, batch, progress,
+                          "score unseen sheets")
+        newview = _predict(model, SpriteDataset(data, index, "newview", train=False), dev, batch, progress,
+                           "score new views")
+        report["complete"] = not progress.stop_requested
+        report["unseen"], report["newview"] = _scores(unseen), _scores(newview)
+        per_cat = []
+        for c, name in enumerate(index["categories"]):
+            rows = [r for r in unseen if r["cat"] == c]
+            if rows:
+                per_cat.append({"category": name, "n": len(rows),
+                                "top1": sum(r["cat_top5"][0] == c for r in rows) / len(rows)})
+        report["per_category"] = sorted(per_cat, key=lambda c: -c["n"])
+        if progress.run_dir and unseen:
+            items = SpriteDataset(data, index, "unseen", train=False).items
+            wrong = sorted((i for i, r in enumerate(unseen) if r["cat_top5"][0] != r["cat"]),
+                           key=lambda i: -unseen[i]["cat_conf"])[:24]
+            draw_watchset(model, data, index, [items[i] for i in wrong], dev,
+                          progress.run_dir / "watchset" / f"mistakes-step-{step:07d}")
+            _write_json_atomic(progress.run_dir / "watchset" / f"mistakes-step-{step:07d}" / "meta.json",
+                               {"step": step, "what": "most confident wrong answers on unseen sheets"})
+
+    md = _render_md(report)
+    targets = [model_dir / "benchmarks"] + ([progress.run_dir] if progress.run_dir else [])
+    for i, target in enumerate(targets):
+        target.mkdir(parents=True, exist_ok=True)
+        stem = f"step-{step:07d}" if i == 0 else "benchmark"
+        (target / f"{stem}.json").write_text(json.dumps(report, indent=2))
+        (target / f"{stem}.md").write_text(md)
+    if progress.run_dir and report.get("per_category"):
+        with open(progress.run_dir / "per_category.csv", "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["category", "n", "top1"])
+            w.writeheader()
+            w.writerows(report["per_category"])
+    print(md, flush=True)
+    s = report["speed"]
+    summary = f"{s['ms_median']:.1f} ms/frame"
+    if "unseen" in report:
+        summary += (f", unseen category {report['unseen'].get('category_top1', 0):.1%}, "
+                    f"new-view state {report['newview'].get('state_top1', 0):.1%}")
+    progress.update("done" if report["complete"] else "stopped", message=summary, eta_seconds=0, force=True)
+    return report

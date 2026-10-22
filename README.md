@@ -3,7 +3,8 @@
 An open vision encoder for Space Station 14: a small model that turns SS14
 screenshots and sprites into features that know what every object is and what
 state it is in. This repo holds the dataset pipeline, training code and
-benchmark. It is early: only the first step (M0, the sprite catalogue) exists.
+benchmark. It is early: the sprite catalogue (M0) and single-sprite
+pretraining of the encoder (stage 1) exist; replay import comes next.
 
 The desktop control panel lives in
 [C4BRA/changeling14-training-gui](https://github.com/C4BRA/changeling14-training-gui).
@@ -57,6 +58,61 @@ On Wizden master (October 2026): 3,195 sheets, 76 excluded as non-commercial,
 
 Rebuilding replaces the previous output. The step refuses a non-empty folder
 it didn't create unless you pass `--force`.
+
+## Stage 1: single-sprite pretraining
+
+The encoder is a hybrid: convolutions read the pixels inside each 32 px
+square and turn it into one token, then a small transformer reasons across
+the squares (the FastViT / MobileCLIP layout). It comes in four sizes with
+the same outputs: nano 2.3M, tiny 9.1M, small 24M and base 76M parameters.
+The input and output spec is in [docs/encoder.md](docs/encoder.md).
+
+Training needs PyTorch. On the Air it runs on the GPU through MPS.
+
+```sh
+pip install -e ".[train,export]"
+changeling14-vision train --size tiny          # reads the M0 catalogue
+changeling14-vision benchmark --size tiny      # held-out scores and ms per frame
+changeling14-vision export --size tiny         # safetensors, ONNX, MLX, Core ML
+```
+
+`train` draws each sprite from the M0 catalogue onto a 96×96 canvas at a
+random spot, on a plain, noisy or real floor-tile background, with
+whole-number zoom and nearest-neighbour rotation. It learns three things
+from the catalogue's own labels: the coarse category from the sheet's folder
+(`Objects/Tools`, `Structures/Doors`, 48 in all), the exact sprite (sheet and
+state), and the facing direction. Screen HUD art (`Interface/`, `Actions/`,
+`Markers/`, …) is left out.
+
+What it holds out, so the scores mean something:
+
+- **Unseen sheets:** 10% of sheets are never trained on. They are scored on
+  category, since their exact sprites are new.
+- **New views:** one direction or animation frame of each trained sprite is
+  held back. These are scored on the exact sprite and on facing.
+
+The model folder (default `~/Desktop/SS13-14/changeling14-models/sprite-pretrain-<size>`)
+holds `latest.pt`, every checkpoint under `checkpoints/`, `metrics.jsonl`,
+and the label index. Running `train` again resumes from `latest.pt`;
+`--fresh` starts over. `--minutes 120` stops cleanly after two hours, so a
+long run can be split across nights. Stopping from the app saves a
+checkpoint first.
+
+At every checkpoint (every 1,000 steps, and at least every 15 minutes) the
+run folder gets a watch set: 24 sprites from unseen sheets, drawn with the
+model's category guess, its confidence and the trained sprite it thinks
+they look most like, framed green or red.
+
+`benchmark` scores every held-out sprite, breaks the unseen-sheet score down
+by category (`per_category.csv`), times a 480×480 frame, and puts the 24
+most confident mistakes into the watch set.
+
+`export` writes the encoder without the training heads, and checks each
+format against PyTorch where its runtime is installed.
+
+Defaults: 20,000 steps of 128 sprites with AdamW and a cosine schedule.
+Memory peaked around 3 GB at batch 128 on CPU; pass `--batch 64` if the Air
+starts swapping.
 
 ## Progress for the training app
 
