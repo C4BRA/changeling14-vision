@@ -14,6 +14,7 @@ folder per checkpoint (docs/run-folder.md).
 from __future__ import annotations
 
 import contextlib
+import copy
 import json
 import math
 import os
@@ -57,6 +58,7 @@ class TrainOptions:
     fresh: bool = False
     amp: bool = False                  # half precision on MPS/CUDA (bfloat16 on CPU)
     text_model: str | None = DEFAULT_TEXT_MODEL   # None: no text matching
+    ema: float = 0.999                 # decay of the weight average that is scored and saved
 
 
 class PretrainModel(nn.Module):
@@ -76,6 +78,8 @@ class PretrainModel(nn.Module):
             self.text_proj = nn.Linear(text_dim, EMBED_DIM)
             self.logit_scale = nn.Parameter(torch.tensor(math.log(10.0)))
             self.logit_bias = nn.Parameter(torch.tensor(-10.0))
+            # Temperature of the comparison against every entity text.
+            self.name_scale = nn.Parameter(torch.tensor(math.log(20.0)))
         self.register_buffer("text_vectors", torch.zeros(0, max(1, text_dim)), persistent=False)
 
     def set_text(self, vectors, texts: list[str] | None = None) -> None:
@@ -118,7 +122,8 @@ def model_from_checkpoint(path: Path) -> tuple[PretrainModel, dict]:
     model = PretrainModel(Encoder(**{k: v for k, v in ckpt["encoder_config"].items() if k != "tile"}),
                           ckpt["n_categories"], ckpt["n_states"], ckpt.get("n_components", 0),
                           ckpt.get("text_dim", 0))
-    model.load_state_dict(ckpt["model"])
+    # The weight average is what training scores and what gets benchmarked and exported.
+    model.load_state_dict(ckpt.get("ema") or ckpt["model"])
     text_file = Path(ckpt.get("out", "")) / "text.npz"
     if model.text_dim and text_file.is_file():
         table = TextTable(text_file)
@@ -176,29 +181,77 @@ def _to(batch: dict, device) -> dict:
 
 
 def _text_loss(model: PretrainModel, out: dict, b: dict) -> torch.Tensor:
-    """SigLIP: every image-text pair in the batch is its own yes/no question."""
-    m = b["text"] >= 0
-    if not model.text_dim or int(m.sum()) < 2:
+    """Two views of the same question, "which entity is this?":
+
+    - SigLIP: every image-text pair in the batch is its own yes/no question.
+    - Every name: a softmax over the whole text table, so each named sprite is
+      pushed away from every other entity at every step, most from the ones it
+      is most easily confused with. Any of the sprite's entities counts as right.
+    The masks are applied without reading anything back from the GPU.
+    """
+    if not model.text_dim:
         return out["category"].sum() * 0
-    rows = b["text"][m]
-    zi = F.normalize(out["global"][m].float(), dim=-1)
+    m = (b["text"] >= 0).float()
+    n = m.sum().clamp(min=1)
+    rows = b["text"].clamp(min=0)
+    zi = F.normalize(out["global"].float(), dim=-1)
     zt = model.text_embeddings(rows)
     logits = zi @ zt.T * model.logit_scale.exp() + model.logit_bias
     labels = (rows[:, None] == rows[None, :]).float() * 2 - 1
-    return -F.logsigmoid(labels * logits).sum() / len(rows)
+    pair = m[:, None] * m[None, :]
+    siglip = -(F.logsigmoid(labels * logits) * pair).sum() / n
+
+    all_t = model.text_embeddings()
+    every = zi @ all_t.T * model.name_scale.exp()                       # (B, texts)
+    right = torch.zeros_like(every, dtype=torch.bool)
+    wanted = b["text_rows"]
+    right.scatter_(1, wanted.clamp(min=0), wanted >= 0)
+    right[:, 0] |= ~right.any(1)          # rows with no name: any target, masked out below
+    nll = torch.logsumexp(every, 1) - torch.logsumexp(every.masked_fill(~right, -1e4), 1)
+    return siglip + (nll * m).sum() / n
+
+
+def _masked_ce(logits: torch.Tensor, target: torch.Tensor, smoothing: float = 0.0) -> torch.Tensor:
+    """Cross-entropy over the rows with a label (-1 = none), with no GPU-to-CPU
+    check of whether there are any: such checks stall the GPU every step."""
+    m = (target >= 0).float()
+    each = F.cross_entropy(logits, target.clamp(min=0), reduction="none", label_smoothing=smoothing)
+    return (each * m).sum() / m.sum().clamp(min=1)
 
 
 def _losses(out: dict, b: dict):
-    zero = out["category"].sum() * 0
     loss_cat = F.cross_entropy(out["category"], b["category"], label_smoothing=0.1)
-    loss_state = F.cross_entropy(out["state"], b["state"], ignore_index=-1, label_smoothing=0.1) \
-        if (b["state"] >= 0).any() else zero
-    loss_dir = F.cross_entropy(out["direction"], b["direction"], ignore_index=-1) \
-        if (b["direction"] >= 0).any() else zero
-    m = b["has_components"]
-    loss_comp = F.binary_cross_entropy_with_logits(out["components"][m], b["components"][m]) * 10 \
-        if m.any() else zero
+    loss_state = _masked_ce(out["state"], b["state"], 0.1)
+    loss_dir = _masked_ce(out["direction"], b["direction"])
+    m = b["has_components"].float()
+    each = F.binary_cross_entropy_with_logits(out["components"], b["components"], reduction="none").mean(1)
+    loss_comp = (each * m).sum() / m.sum().clamp(min=1) * 10
     return loss_cat + loss_state + 0.5 * loss_dir + loss_comp, (loss_cat, loss_state, loss_dir, loss_comp)
+
+
+class WeightAverage:
+    """An exponential moving average of the weights (and batch-norm statistics),
+    kept in a second copy of the model that is scored, saved and exported.
+    The decay ramps up from 0, so early checkpoints are not stuck near the
+    random start."""
+
+    def __init__(self, model: nn.Module, decay: float):
+        self.model = copy.deepcopy(model).eval()
+        for p in self.model.parameters():
+            p.requires_grad_(False)
+        self.decay = decay
+        self.updates = 0
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        self.updates += 1
+        d = min(self.decay, (1 + self.updates) / (10 + self.updates))
+        avg = [v for v in self.model.state_dict().values() if v.dtype.is_floating_point]
+        new = [v for v in model.state_dict().values() if v.dtype.is_floating_point]
+        torch._foreach_lerp_(avg, new, 1 - d)
+        for a, v in zip(self.model.state_dict().values(), model.state_dict().values()):
+            if not a.dtype.is_floating_point:
+                a.copy_(v)
 
 
 @torch.no_grad()
@@ -308,6 +361,7 @@ def train(opts: TrainOptions, progress: Progress | None = None) -> dict:
     model = build_model(opts.size, index, text.dim if text else 0).to(device)
     if text:
         model.set_text(text.vectors, text.texts)
+    average = WeightAverage(model, opts.ema)
     decay = [p for n, p in model.named_parameters() if p.ndim >= 2]
     no_decay = [p for n, p in model.named_parameters() if p.ndim < 2]
     optim = torch.optim.AdamW([{"params": decay, "weight_decay": opts.weight_decay},
@@ -323,6 +377,8 @@ def train(opts: TrainOptions, progress: Progress | None = None) -> dict:
                              "pass --fresh to start over, or match the earlier setting")
         model.load_state_dict(ckpt["model"])
         optim.load_state_dict(ckpt["optim"])
+        average.model.load_state_dict(ckpt.get("ema") or ckpt["model"])
+        average.updates = ckpt.get("ema_updates", ckpt["step"])
         step = ckpt["step"]
         print(f"train: resumed {latest} at step {step:,}", flush=True)
     else:
@@ -347,10 +403,11 @@ def train(opts: TrainOptions, progress: Progress | None = None) -> dict:
         if reason != "stop":
             progress.update("evaluate", step, opts.steps, "scoring held-out sprites", force=True)
             stop = lambda: progress.stop_requested
-            scores = {"unseen": evaluate(model, _loader(unseen_ds, opts.batch, False, 0, 0), device, stop),
-                      "newview": evaluate(model, _loader(newview_ds, opts.batch, False, 0, 0), device, stop)}
+            scores = {"unseen": evaluate(average.model, _loader(unseen_ds, opts.batch, False, 0, 0), device, stop),
+                      "newview": evaluate(average.model, _loader(newview_ds, opts.batch, False, 0, 0), device, stop)}
         name = f"step-{step:07d}"
         state = {"step": step, "model": model.state_dict(), "optim": optim.state_dict(),
+                 "ema": average.model.state_dict(), "ema_updates": average.updates,
                  "encoder_config": model.encoder.config, "n_categories": len(index["categories"]),
                  "n_states": len(index["states"]), "n_components": len(index.get("components", ())),
                  "text_dim": model.text_dim, "text_model": text.model if text else None,
@@ -372,7 +429,7 @@ def train(opts: TrainOptions, progress: Progress | None = None) -> dict:
             with open(target / "metrics.jsonl", "a", encoding="utf-8") as f:
                 f.write(json.dumps(row) + "\n")
         if progress.run_dir and reason != "stop":
-            draw_watchset(model, opts.data, index, watch_items, device,
+            draw_watchset(average.model, opts.data, index, watch_items, device,
                           progress.run_dir / "watchset" / name, seed=opts.seed, text=text)
             _write_json_atomic(progress.run_dir / "watchset" / name / "meta.json",
                                {k: v for k, v in row.items() if v is not None})
@@ -381,6 +438,7 @@ def train(opts: TrainOptions, progress: Progress | None = None) -> dict:
         return row
 
     window: list[float] = []
+    pending: list[torch.Tensor] = []
 
     def avg_loss() -> float | None:
         return sum(window) / len(window) if window else None
@@ -416,11 +474,17 @@ def train(opts: TrainOptions, progress: Progress | None = None) -> dict:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optim.step()
+            average.update(model)
             step += 1
-            window.append(loss.item())
-            del window[:-100]
+            # Reading the loss waits for the GPU, so only every 10 steps.
+            pending.append(loss.detach())
+            if len(pending) >= 10:
+                window.extend(torch.stack(pending).tolist())
+                pending.clear()
+                del window[:-100]
             rate = (time.time() - t0) / max(1, step - step0)
-            progress.update("train", step, opts.steps, f"loss {avg_loss():.3f}, {1 / rate * opts.batch:.0f} img/s",
+            speed = f"{1 / rate * opts.batch:.0f} img/s"
+            progress.update("train", step, opts.steps, f"loss {avg_loss():.3f}, {speed}" if window else speed,
                             eta_seconds=rate * (opts.steps - step))
             if step % 50 == 0:
                 print(f"step {step:,}/{opts.steps:,}  loss {avg_loss():.4f}  lr {lr_at(step, opts):.2e}  "

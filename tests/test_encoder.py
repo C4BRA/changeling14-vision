@@ -278,6 +278,7 @@ def test_text_matching_trains_and_scores(tmp_path, monkeypatch):
         assert r["rank"] == next((k + 1 for k, g in enumerate(guessed) if g in right), None)
     ckpt = torch.load(out / "latest.pt", weights_only=False)
     assert ckpt["text_dim"] == 16 and ckpt["text_model"] == "fake"
+    assert ckpt["ema"].keys() == ckpt["model"].keys() and ckpt["ema_updates"] == ckpt["step"]
     # Resuming without text matching is refused rather than silently mixing setups.
     with pytest.raises(SystemExit):
         train(TrainOptions(data=data, out=out, size="nano", steps=6, batch=8, workers=0, device="cpu",
@@ -303,3 +304,19 @@ def test_watchset_prefers_things_players_see():
     assert {cats[it["category"]] for it in picked} == {"Clothing/Eyes", "Objects/Tools"}
     picked = pick_watchset(index, 1, n=12, named=True)       # runs short: markings fill in
     assert sum(cats[it["category"]] == "Mobs/Customization" for it in picked) == 2
+
+
+def test_name_loss_counts_every_entity_and_skips_unnamed():
+    from changeling14_vision.pretrain.train import PretrainModel, _text_loss
+    from changeling14_vision.model.encoder import build_encoder
+    torch.manual_seed(0)
+    model = PretrainModel(build_encoder("nano"), 3, 4, 2, text_dim=8)
+    model.set_text(torch.randn(5, 8), [f"t{i}. x" for i in range(5)])
+    g = torch.randn(3, EMBED_DIM, requires_grad=True)
+    out = {"global": g, "category": torch.zeros(3, 3)}
+    rows = torch.tensor([[0, 3, -1], [1, -1, -1], [-1, -1, -1]])
+    b = {"text": torch.tensor([0, 1, -1]), "text_rows": rows}
+    loss = _text_loss(model, out, b)
+    loss.backward()
+    assert torch.isfinite(loss) and g.grad[0].abs().sum() > 0
+    assert g.grad[2].abs().sum() == 0            # no name: no pull either way
