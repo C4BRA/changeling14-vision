@@ -183,7 +183,7 @@ def benchmark(model_dir: Path, data: Path, progress: Progress | None = None, che
             wrong = sorted((i for i, r in enumerate(unseen) if r["cat_top5"][0] != r["cat"]),
                            key=lambda i: -unseen[i]["cat_conf"])[:24]
             draw_watchset(model, data, index, [items[i] for i in wrong], dev,
-                          progress.run_dir / "watchset" / f"mistakes-step-{step:07d}", text=text)
+                          progress.run_dir / "watchset" / f"mistakes-step-{step:07d}", text=text, captions=True)
             _write_json_atomic(progress.run_dir / "watchset" / f"mistakes-step-{step:07d}" / "meta.json",
                                {"step": step, "what": "most confident wrong answers on unseen sheets"})
 

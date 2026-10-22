@@ -107,6 +107,12 @@ def test_train_resume_benchmark_export(tmp_path):
     assert marks == ["step-0000000", "step-0000004", "step-0000006"]
     assert json.loads((run / "watchset" / "step-0000004" / "meta.json").read_text())["step"] == 4
     assert list((run / "watchset" / "step-0000004").glob("*.png"))
+    preds = json.loads((run / "watchset" / "step-0000004" / "predictions.json").read_text())
+    for row in preds["items"]:
+        # Sprites with no entity name fall back to the folder group.
+        assert row["kind"] == "name" or row["name"] == row["group"]
+        assert (run / "watchset" / "step-0000004" / row["image"]).is_file()
+        assert row["rank"] in (None, 1, 2, 3, 4, 5) and 1 <= len(row["guesses"]) <= 5
     assert len((out / "metrics.jsonl").read_text().splitlines()) == 3
 
     # Resume carries on from latest.pt.
@@ -240,6 +246,14 @@ def test_text_matching_trains_and_scores(tmp_path, monkeypatch):
     table = text_mod.TextTable(out / "text.npz")
     assert table.dim == 16 and "tool. A tool0 for testing." in table.texts
     assert result["last"]["unseen_text_top5"] is not None
+    preds = json.loads((run / "watchset" / "step-0000004" / "predictions.json").read_text())
+    named = [r for r in preds["items"] if r["kind"] == "name"]
+    assert named and all(r["name"] in r["names"] and ". " not in r["name"] for r in named)
+    for r in named:
+        guessed = [g["name"].lower() for g in r["guesses"]]
+        assert len(guessed) == len(set(guessed))          # one entry per name
+        right = {n.lower() for n in r["names"]}
+        assert r["rank"] == next((k + 1 for k, g in enumerate(guessed) if g in right), None)
     ckpt = torch.load(out / "latest.pt", weights_only=False)
     assert ckpt["text_dim"] == 16 and ckpt["text_model"] == "fake"
     # Resuming without text matching is refused rather than silently mixing setups.
@@ -249,3 +263,21 @@ def test_text_matching_trains_and_scores(tmp_path, monkeypatch):
     from changeling14_vision.pretrain.benchmark import benchmark
     report = benchmark(out, data, Progress(tmp_path / "bench"), device="cpu")
     assert "text_top1" in report["unseen"]
+
+
+def test_watchset_prefers_things_players_see():
+    from changeling14_vision.pretrain.watch import pick_watchset, preferred
+    assert preferred("Clothing/Eyes") and preferred("Objects/Tools") and preferred("Mobs/Pets")
+    assert not preferred("Mobs/Customization") and not preferred("Structures/Walls")
+    assert not preferred("Objects/Tiles") and not preferred("Effects")
+
+    def item(cat, n):
+        return {"split": "unseen", "direction": -1, "path": f"{cat}{n}_f0.png", "worn": False,
+                "category": cat, "entities": ["e"], "sheet": "s", "state": "x"}
+    cats = ["Clothing/Eyes", "Mobs/Customization", "Objects/Tools"]
+    index = {"counts": {"unseen": 1}, "categories": cats,
+             "items": [item(c, n) for c in range(3) for n in range(5)]}
+    picked = pick_watchset(index, 1, n=6, named=True)
+    assert {cats[it["category"]] for it in picked} == {"Clothing/Eyes", "Objects/Tools"}
+    picked = pick_watchset(index, 1, n=12, named=True)       # runs short: markings fill in
+    assert sum(cats[it["category"]] == "Mobs/Customization" for it in picked) == 2

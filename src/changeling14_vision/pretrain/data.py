@@ -209,9 +209,12 @@ class Augment:
     zoom: float = 0.15         # chance of a 2x whole-number zoom for small sprites
     rotate: float = 0.25       # chance of a random nearest-neighbour rotation (one-direction sprites only)
     floor: float = 0.35        # chance of a real floor-tile background
+    background: tuple | None = None   # a fixed RGB background instead (watch set)
 
 
 def _background(rng: random.Random, dataset: Path, floors: list[str], aug: Augment) -> Image.Image:
+    if aug.background is not None:
+        return Image.new("RGBA", (CANVAS, CANVAS), (*aug.background, 255))
     if floors and rng.random() < aug.floor:
         with Image.open(dataset / rng.choice(floors)) as tile:
             tile = tile.convert("RGBA")
