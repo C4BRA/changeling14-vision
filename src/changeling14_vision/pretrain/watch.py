@@ -3,9 +3,9 @@ checkpoint, so progress (and obvious failures) show at a glance in the app.
 
 The sprites come from sheets the model never trains on, one or two from each
 category. Each image is the 64x64 input at 3x, with a caption: the true
-category, the predicted one with its confidence, and the entity components
-the model sees most surely (Item, MeleeWeapon, Door...). The frame is green
-when the category is right.
+category, the predicted one with its confidence, and the entity name whose
+text it matches best (or, without text matching, the components it sees most
+surely). The frame is green when the category is right.
 """
 
 from __future__ import annotations
@@ -77,6 +77,12 @@ def draw_watchset(model, dataset: Path, index: dict, items: list[dict], device, 
     state_best = out["state"].argmax(1).cpu()
     comp_p = out["components"].sigmoid().cpu()
     vocab = index.get("components") or []
+    text_names = text_best = None
+    texts = getattr(model, "text_names", None)
+    if texts and model.text_dim and len(model.text_vectors):
+        g = torch.nn.functional.normalize(out["global"], dim=-1)
+        text_best = (g @ model.text_embeddings().T).argmax(1).cpu()
+        text_names = texts
     font = _font()
     paths = []
     for i, (it, arr) in enumerate(zip(items, canvases)):
@@ -93,7 +99,9 @@ def draw_watchset(model, dataset: Path, index: dict, items: list[dict], device, 
         d.text((4, y), _short(f"is   {index['categories'][it['category']]}"), fill=(200, 200, 200), font=font)
         d.text((4, y + 12), _short(f"says {index['categories'][int(pred)]} {float(conf):.0%}"),
                fill=GOOD if ok else BAD, font=font)
-        if vocab:
+        if text_names:
+            third = f"like {text_names[int(text_best[i])]}"
+        elif vocab:
             best = [vocab[j] for j in comp_p[i].argsort(descending=True)[:3].tolist() if comp_p[i][j] > 0.5]
             third = "has " + (", ".join(best) if best else "?")
         else:

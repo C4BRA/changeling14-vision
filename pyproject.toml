@@ -20,6 +20,9 @@ train = [
     "numpy>=1.26",
     "safetensors>=0.4",
 ]
+text = [
+    "sentence-transformers>=3.0",
+]
 export = [
     "onnx>=1.16",
     "onnxruntime>=1.18",

@@ -70,7 +70,7 @@ The input and output spec is in [docs/encoder.md](docs/encoder.md).
 Training needs PyTorch. On the Air it runs on the GPU through MPS.
 
 ```sh
-pip install -e ".[train,export]"
+pip install -e ".[train,text,export]"
 changeling14-vision train --size tiny          # reads the M0 catalogue
 changeling14-vision benchmark --size tiny      # held-out scores and ms per frame
 changeling14-vision export --size tiny         # safetensors, ONNX, MLX, Core ML
@@ -79,7 +79,15 @@ changeling14-vision export --size tiny         # safetensors, ONNX, MLX, Core ML
 `train` draws each sprite from the M0 catalogue onto a 64×64 canvas at a
 random spot, on a plain, noisy or real floor-tile background, with
 whole-number zoom and nearest-neighbour rotation. It learns from the
-catalogue's own labels: the components of the entities that draw the sprite
+catalogue's own labels. The main one is text: each sprite is matched to the
+name and description of an entity that draws it ("glass airlock. It opens,
+it closes, you can see through it"). A small frozen sentence model (MiniLM,
+downloaded once, about 90 MB) turns those texts into vectors before training
+starts, so similar meanings sit close together, and the encoder learns to
+land each sprite near its own text (SigLIP's loss). That is what lets a new
+sprite of a familiar kind be named, and later lets anyone ask the encoder
+questions in plain words. `--no-text` turns it off; `--text-model` picks
+another sentence model, which means training again. Alongside text: the components of the entities that draw the sprite
 (Item, Clothing, MeleeWeapon, Door…; 41% of object sprites have an entity),
 the coarse category from the sheet's folder (`Objects/Tools`,
 `Structures/Doors`, 48 in all), the exact sprite (sheet and state), and the
@@ -105,10 +113,11 @@ checkpoint first.
 
 At every checkpoint (every 1,000 steps, and at least every 15 minutes) the
 run folder gets a watch set: 24 sprites from unseen sheets, drawn with the
-model's category guess, its confidence and the trained sprite it thinks
-they look most like, framed green or red.
+model's category guess, its confidence and the entity name whose text it
+matches best, framed green or red.
 
-`benchmark` scores every held-out sprite, breaks the unseen-sheet score down
+`benchmark` scores every held-out sprite (including naming unseen-sheet
+sprites from all ~9k entity texts, top-1 and top-5), breaks the unseen-sheet score down
 by category (`per_category.csv`), times a 480×480 frame, and puts the 24
 most confident mistakes into the watch set.
 

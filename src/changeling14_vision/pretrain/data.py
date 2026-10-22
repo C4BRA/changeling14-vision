@@ -9,6 +9,8 @@ Labels, all from the catalogue, never hand-made:
   components what the entities that draw the sprite are made of (Item,
              Clothing, MeleeWeapon, Door, Edible...): several per sprite,
              only for sprites an entity draws
+  text       the name and description of an entity that draws the sprite,
+             matched through a frozen sentence model (pretrain/text.py)
   category   coarse group from the sheet's folder, e.g. Objects/Tools
   state      the (sheet, state) pair: the sprite's exact visual identity
   direction  0-3 for four-direction states, else ignored
@@ -42,7 +44,8 @@ MIN_CATEGORY_SHEETS = 8
 # Screen HUD and editor-only art: out of scope for an in-world encoder.
 SKIP_PREFIXES = ("Interface/", "Markers/", "Actions/", "Parallaxes/", "LobbyScreens/", "Logo/",
                  "Tips/", "deprecated")
-INDEX_VERSION = 4
+INDEX_VERSION = 5
+MAX_TEXTS = 8           # text rows kept per sprite for scoring
 # A component becomes a label when at least this many linked sprites have it,
 # and at most this share of them (Sprite, Physics and the like say nothing).
 MIN_COMPONENT_STATES = 30
@@ -150,17 +153,20 @@ def _attach_components(dataset: Path, items: list[dict]) -> list[str]:
     if not (cat / "sprite_links.jsonl").is_file() or not (cat / "entities.jsonl").is_file():
         for it in items:
             it["components"] = None
+            it["entities"] = []
         return []
     entity_components = {}
     for line in (cat / "entities.jsonl").open(encoding="utf-8"):
         e = json.loads(line)
         entity_components[e["id"]] = e.get("components") or []
     per_state: dict[tuple[str, str], set[str]] = {}
+    users: dict[tuple[str, str], list[str]] = {}
     for line in (cat / "sprite_links.jsonl").open(encoding="utf-8"):
         link = json.loads(line)
         comps: set[str] = set()
         for user in link["entities"]:
             comps.update(entity_components.get(user["entity"], ()))
+        users[(link["sheet"], link["state"])] = sorted({u["entity"] for u in link["entities"]})
         if comps:
             per_state[(link["sheet"], link["state"])] = comps
     linked = {(it["sheet"], it["state"]) for it in items} & per_state.keys()
@@ -171,6 +177,7 @@ def _attach_components(dataset: Path, items: list[dict]) -> list[str]:
     for it in items:
         comps = per_state.get((it["sheet"], it["state"]))
         it["components"] = sorted(ids[c] for c in comps if c in ids) if comps is not None else None
+        it["entities"] = users.get((it["sheet"], it["state"]), [])
     return vocab
 
 
@@ -252,11 +259,13 @@ class SpriteDataset:
     """Map-style dataset usable by torch's DataLoader (no torch import here)."""
 
     def __init__(self, dataset: Path, index: dict, split: str, train: bool, seed: int = 14,
-                 worn: bool = True):
+                 worn: bool = True, text=None):
         self.dataset = Path(dataset)
         self.items = [it for it in index["items"] if it["split"] == split and (worn or not it["worn"])]
         self.floors = floor_tiles(self.dataset, index)
         self.n_components = len(index.get("components", ()))
+        # Rows of the text table (pretrain/text.py) for the entities that draw each sprite.
+        self.text_rows = [text.rows_for(it.get("entities", [])) if text else [] for it in self.items]
         self.train = train
         self.seed = seed
         self.epoch = 0
@@ -280,5 +289,10 @@ class SpriteDataset:
         comps = np.zeros(max(1, self.n_components), dtype=np.float32)
         if item.get("components"):
             comps[item["components"]] = 1.0
+        rows = self.text_rows[i]
+        all_rows = np.full(MAX_TEXTS, -1, dtype=np.int64)
+        all_rows[:len(rows[:MAX_TEXTS])] = rows[:MAX_TEXTS]
+        text = (rng.choice(rows) if self.train else rows[0]) if rows else -1
         return {"x": x, "category": item["category"], "state": item["state_id"], "direction": item["direction"],
-                "components": comps, "has_components": item.get("components") is not None}
+                "components": comps, "has_components": item.get("components") is not None,
+                "text": text, "text_rows": all_rows}

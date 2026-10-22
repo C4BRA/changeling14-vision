@@ -64,7 +64,8 @@ def _fake_dataset(root: Path) -> Path:
     for s in sheets[:-1]:
         name = Path(s).stem
         comps = ["Sprite", "Item", "Tool"] if "Tools" in s else ["Sprite", "Door", "Airlock"]
-        entities.append({"id": name, "components": comps})
+        entities.append({"id": name, "components": comps, "name": name.rstrip("0123456789"),
+                         "description": f"A {name} for testing."})
         links += [{"sheet": s, "state": st, "entities": [{"entity": name, "role": "sprite"}]} for st in ("icon", "open")]
     with open(root / "catalogue" / "entities.jsonl", "w") as f:
         f.writelines(json.dumps(e) + "\n" for e in entities)
@@ -189,3 +190,36 @@ def test_stop_signal_to_process_group_saves_checkpoint(tmp_path):
     assert proc.wait(timeout=30) == 143
     assert json.loads((run / "status.json").read_text())["stage"] == "stopped"
     assert torch.load(out / "latest.pt", weights_only=False)["step"] >= 3
+
+
+def test_text_matching_trains_and_scores(tmp_path, monkeypatch):
+    """With a stand-in sentence model: the text table is built once, the SigLIP
+    loss runs, and unseen sprites are scored by naming them from all texts."""
+    from changeling14_vision.pretrain import text as text_mod
+    from changeling14_vision.pretrain.train import TrainOptions, train
+    from changeling14_vision.progress import Progress
+
+    def fake_embedder(model_name, device=None):
+        def embed(texts, batch=256):
+            rng = [np.random.default_rng(abs(hash(t)) % 2**32).normal(size=16) for t in texts]
+            return np.stack(rng)
+        return embed
+
+    monkeypatch.setattr(text_mod, "sentence_embedder", fake_embedder)
+    data = _fake_dataset(tmp_path / "ds")
+    out, run = tmp_path / "model", tmp_path / "run"
+    opts = TrainOptions(data=data, out=out, size="nano", steps=4, batch=8, workers=0, device="cpu",
+                        checkpoint_every=4, warmup=1, text_model="fake")
+    result = train(opts, Progress(run))
+    table = text_mod.TextTable(out / "text.npz")
+    assert table.dim == 16 and "tool. A tool0 for testing." in table.texts
+    assert result["last"]["unseen_text_top5"] is not None
+    ckpt = torch.load(out / "latest.pt", weights_only=False)
+    assert ckpt["text_dim"] == 16 and ckpt["text_model"] == "fake"
+    # Resuming without text matching is refused rather than silently mixing setups.
+    with pytest.raises(SystemExit):
+        train(TrainOptions(data=data, out=out, size="nano", steps=6, batch=8, workers=0, device="cpu",
+                           text_model=None), Progress(None))
+    from changeling14_vision.pretrain.benchmark import benchmark
+    report = benchmark(out, data, Progress(tmp_path / "bench"), device="cpu")
+    assert "text_top1" in report["unseen"]

@@ -32,6 +32,7 @@ from .. import __version__
 from ..model.encoder import EMBED_DIM, Encoder, build_encoder, count_parameters
 from ..progress import Progress, _write_json_atomic
 from .data import SpriteDataset, load_or_build_index
+from .text import DEFAULT_TEXT_MODEL, TextTable, build_text_table
 from .watch import WATCHSET_SIZE, draw_watchset, pick_watchset
 
 EVAL_LIMIT = 2048
@@ -55,23 +56,41 @@ class TrainOptions:
     seed: int = 14
     fresh: bool = False
     amp: bool = False                  # half precision on MPS/CUDA (bfloat16 on CPU)
+    text_model: str | None = DEFAULT_TEXT_MODEL   # None: no text matching
 
 
 class PretrainModel(nn.Module):
     """The encoder plus the stage-1 heads. Only the encoder is exported."""
 
-    def __init__(self, encoder: Encoder, n_categories: int, n_states: int, n_components: int = 0):
+    def __init__(self, encoder: Encoder, n_categories: int, n_states: int, n_components: int = 0,
+                 text_dim: int = 0):
         super().__init__()
         self.encoder = encoder
         self.category = nn.Linear(EMBED_DIM, n_categories)
         self.state = nn.Linear(EMBED_DIM, n_states)
         self.direction = nn.Linear(EMBED_DIM, 4)
         self.components = nn.Linear(EMBED_DIM, max(1, n_components))
+        self.text_dim = text_dim
+        if text_dim:
+            # Frozen sentence vectors come in; a learned map puts them in the encoder's space.
+            self.text_proj = nn.Linear(text_dim, EMBED_DIM)
+            self.logit_scale = nn.Parameter(torch.tensor(math.log(10.0)))
+            self.logit_bias = nn.Parameter(torch.tensor(-10.0))
+        self.register_buffer("text_vectors", torch.zeros(0, max(1, text_dim)), persistent=False)
+
+    def set_text(self, vectors, texts: list[str] | None = None) -> None:
+        self.text_vectors = torch.as_tensor(vectors, dtype=torch.float32, device=self.category.weight.device)
+        # Entity names, for captions: "name. description" -> "name".
+        self.text_names = [t.split(". ", 1)[0] for t in texts] if texts else None
+
+    def text_embeddings(self, rows: torch.Tensor | None = None) -> torch.Tensor:
+        t = self.text_vectors if rows is None else self.text_vectors[rows]
+        return F.normalize(self.text_proj(t), dim=-1)
 
     def forward(self, x) -> dict:
         _tiles, g = self.encoder(x)
         return {"category": self.category(g), "state": self.state(g), "direction": self.direction(g),
-                "components": self.components(g)}
+                "components": self.components(g), "global": g}
 
 
 def pick_device(name: str = "auto") -> torch.device:
@@ -84,9 +103,9 @@ def pick_device(name: str = "auto") -> torch.device:
     return torch.device("cpu")
 
 
-def build_model(size: str, index: dict) -> PretrainModel:
+def build_model(size: str, index: dict, text_dim: int = 0) -> PretrainModel:
     return PretrainModel(build_encoder(size), len(index["categories"]), len(index["states"]),
-                         len(index.get("components", ())))
+                         len(index.get("components", ())), text_dim)
 
 
 def load_checkpoint(path: Path, map_location="cpu") -> dict:
@@ -97,8 +116,13 @@ def model_from_checkpoint(path: Path) -> tuple[PretrainModel, dict]:
     """Rebuild the model from a latest.pt or checkpoints/step-N.pt file."""
     ckpt = load_checkpoint(path)
     model = PretrainModel(Encoder(**{k: v for k, v in ckpt["encoder_config"].items() if k != "tile"}),
-                          ckpt["n_categories"], ckpt["n_states"], ckpt.get("n_components", 0))
+                          ckpt["n_categories"], ckpt["n_states"], ckpt.get("n_components", 0),
+                          ckpt.get("text_dim", 0))
     model.load_state_dict(ckpt["model"])
+    text_file = Path(ckpt.get("out", "")) / "text.npz"
+    if model.text_dim and text_file.is_file():
+        table = TextTable(text_file)
+        model.set_text(table.vectors, table.texts)
     return model, ckpt
 
 
@@ -151,6 +175,19 @@ def _to(batch: dict, device) -> dict:
     return {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
 
+def _text_loss(model: PretrainModel, out: dict, b: dict) -> torch.Tensor:
+    """SigLIP: every image-text pair in the batch is its own yes/no question."""
+    m = b["text"] >= 0
+    if not model.text_dim or int(m.sum()) < 2:
+        return out["category"].sum() * 0
+    rows = b["text"][m]
+    zi = F.normalize(out["global"][m].float(), dim=-1)
+    zt = model.text_embeddings(rows)
+    logits = zi @ zt.T * model.logit_scale.exp() + model.logit_bias
+    labels = (rows[:, None] == rows[None, :]).float() * 2 - 1
+    return -F.logsigmoid(labels * logits).sum() / len(rows)
+
+
 def _losses(out: dict, b: dict):
     zero = out["category"].sum() * 0
     loss_cat = F.cross_entropy(out["category"], b["category"], label_smoothing=0.1)
@@ -168,9 +205,10 @@ def _losses(out: dict, b: dict):
 def evaluate(model: PretrainModel, loader, device, stop=lambda: False) -> dict:
     """Top-1/top-5 on whichever labels the split has."""
     model.eval()
-    n_cat = n_state = n_dir = 0
-    cat1 = cat5 = st1 = st5 = dir1 = 0
+    n_cat = n_state = n_dir = n_txt = 0
+    cat1 = cat5 = st1 = st5 = dir1 = tx1 = tx5 = 0
     tp = fp = fn = 0
+    all_text = model.text_embeddings() if model.text_dim and len(model.text_vectors) else None
     for batch in loader:
         if stop():
             break
@@ -178,6 +216,14 @@ def evaluate(model: PretrainModel, loader, device, stop=lambda: False) -> dict:
         cat, state, direction = b["category"], b["state"], b["direction"]
         out = model(b["x"])
         c, s, d = out["category"], out["state"], out["direction"]
+        m = b["text"] >= 0
+        if all_text is not None and m.any():
+            sims = F.normalize(out["global"][m], dim=-1) @ all_text.T
+            top = sims.topk(min(5, sims.shape[1]), dim=1).indices            # (n, 5)
+            hit = (top[:, :, None] == b["text_rows"][m][:, None, :]).any(-1)  # (n, 5)
+            tx1 += hit[:, 0].sum().item()
+            tx5 += hit.any(1).sum().item()
+            n_txt += int(m.sum())
         m = b["has_components"]
         if m.any():
             pred = out["components"][m] > 0
@@ -207,6 +253,8 @@ def evaluate(model: PretrainModel, loader, device, stop=lambda: False) -> dict:
         out.update(state_top1=st1 / n_state, state_top5=st5 / n_state)
     if n_dir:
         out.update(direction_top1=dir1 / n_dir)
+    if n_txt:
+        out.update(text_top1=tx1 / n_txt, text_top5=tx5 / n_txt, text_n=n_txt)
     if tp + fp + fn:
         precision, recall = tp / max(1, tp + fp), tp / max(1, tp + fn)
         out.update(components_precision=precision, components_recall=recall,
@@ -242,8 +290,22 @@ def train(opts: TrainOptions, progress: Progress | None = None) -> dict:
     print(f"train: {index['counts']} images, {len(index['categories'])} categories, "
           f"{len(index['states']):,} states", flush=True)
 
+    text = None
+    if opts.text_model:
+        try:
+            progress.update("embed text", message=opts.text_model, force=True)
+            text = TextTable(build_text_table(opts.data, out, model_name=opts.text_model, progress=progress))
+            print(f"train: {len(text.texts):,} entity texts from {text.model}", flush=True)
+        except ImportError:
+            print("train: sentence-transformers is not installed, so training runs without text matching "
+                  '(pip install -e ".[text]")', flush=True)
+        except ValueError as exc:
+            print(f"train: no text matching: {exc}", flush=True)
+
     device = pick_device(opts.device)
-    model = build_model(opts.size, index).to(device)
+    model = build_model(opts.size, index, text.dim if text else 0).to(device)
+    if text:
+        model.set_text(text.vectors, text.texts)
     decay = [p for n, p in model.named_parameters() if p.ndim >= 2]
     no_decay = [p for n, p in model.named_parameters() if p.ndim < 2]
     optim = torch.optim.AdamW([{"params": decay, "weight_decay": opts.weight_decay},
@@ -254,6 +316,9 @@ def train(opts: TrainOptions, progress: Progress | None = None) -> dict:
         if ckpt["encoder_config"]["size"] != opts.size:
             raise SystemExit(f"{out} holds a {ckpt['encoder_config']['size']} model, not {opts.size}; "
                              "pick another --out or pass --fresh")
+        if ckpt.get("text_dim", 0) != model.text_dim:
+            raise SystemExit(f"{out} was trained {'with' if ckpt.get('text_dim') else 'without'} text matching; "
+                             "pass --fresh to start over, or match the earlier setting")
         model.load_state_dict(ckpt["model"])
         optim.load_state_dict(ckpt["optim"])
         step = ckpt["step"]
@@ -266,11 +331,11 @@ def train(opts: TrainOptions, progress: Progress | None = None) -> dict:
     params = count_parameters(model.encoder)
     print(f"train: {opts.size} encoder, {params / 1e6:.1f}M parameters, on {device}", flush=True)
 
-    train_ds = SpriteDataset(opts.data, index, "train", train=True, seed=opts.seed)
-    unseen_ds = _subset(SpriteDataset(opts.data, index, "unseen", train=False, seed=opts.seed, worn=False),
-                        EVAL_LIMIT, opts.seed)
-    newview_ds = _subset(SpriteDataset(opts.data, index, "newview", train=False, seed=opts.seed, worn=False),
-                         EVAL_LIMIT, opts.seed)
+    train_ds = SpriteDataset(opts.data, index, "train", train=True, seed=opts.seed, text=text)
+    unseen_ds = _subset(SpriteDataset(opts.data, index, "unseen", train=False, seed=opts.seed, worn=False,
+                                      text=text), EVAL_LIMIT, opts.seed)
+    newview_ds = _subset(SpriteDataset(opts.data, index, "newview", train=False, seed=opts.seed, worn=False,
+                                       text=text), EVAL_LIMIT, opts.seed)
     loader = _loader(train_ds, opts.batch, True, opts.workers, opts.seed + step)
     watch_items = pick_watchset(index, opts.seed, WATCHSET_SIZE)
 
@@ -286,6 +351,7 @@ def train(opts: TrainOptions, progress: Progress | None = None) -> dict:
         state = {"step": step, "model": model.state_dict(), "optim": optim.state_dict(),
                  "encoder_config": model.encoder.config, "n_categories": len(index["categories"]),
                  "n_states": len(index["states"]), "n_components": len(index.get("components", ())),
+                 "text_dim": model.text_dim, "text_model": text.model if text else None,
                  "out": str(out), "version": __version__,
                  "options": {k: str(v) if isinstance(v, Path) else v for k, v in asdict(opts).items()}}
         _save(latest, state)
@@ -294,6 +360,8 @@ def train(opts: TrainOptions, progress: Progress | None = None) -> dict:
                "unseen_category_top1": scores["unseen"].get("category_top1"),
                "unseen_category_top5": scores["unseen"].get("category_top5"),
                "unseen_components_f1": scores["unseen"].get("components_f1"),
+               "unseen_text_top1": scores["unseen"].get("text_top1"),
+               "unseen_text_top5": scores["unseen"].get("text_top5"),
                "newview_state_top1": scores["newview"].get("state_top1"),
                "newview_state_top5": scores["newview"].get("state_top5"),
                "newview_direction_top1": scores["newview"].get("direction_top1"),
@@ -332,7 +400,9 @@ def train(opts: TrainOptions, progress: Progress | None = None) -> dict:
                 group["lr"] = lr_at(step, opts)
             with autocast():
                 out_ = model(b["x"])
-            loss, _parts = _losses({k: v.float() for k, v in out_.items()}, b)
+            out_ = {k: v.float() for k, v in out_.items()}
+            loss, _parts = _losses(out_, b)
+            loss = loss + _text_loss(model, out_, b)
             optim.zero_grad(set_to_none=True)
             if scaler:
                 scaler.scale(loss).backward()

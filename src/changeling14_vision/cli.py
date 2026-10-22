@@ -61,7 +61,7 @@ def cmd_train(args) -> int:
                         steps=args.steps, batch=args.batch, lr=args.lr, workers=args.workers,
                         checkpoint_every=args.checkpoint_every, checkpoint_minutes=args.checkpoint_minutes,
                         minutes=args.minutes, device=args.device, seed=args.seed, fresh=args.fresh,
-                        amp=args.amp)
+                        amp=args.amp, text_model=None if args.no_text else args.text_model)
     progress = Progress(args.run_dir)
     progress.catch_stop()
     print(f"train: sprites from {opts.data}, model folder {opts.out}", flush=True)
@@ -133,6 +133,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="also checkpoint at least this often (default 15)")
     p.add_argument("--minutes", type=float, help="stop cleanly after this many minutes; run again to resume")
     p.add_argument("--fresh", action="store_true", help="start over instead of resuming latest.pt")
+    p.add_argument("--text-model", default="sentence-transformers/all-MiniLM-L6-v2",
+                   help="sentence model for matching sprites to entity names (downloaded once)")
+    p.add_argument("--no-text", action="store_true", help="train without text matching")
     p.add_argument("--amp", action="store_true",
                    help="half precision on the GPU: often faster on Apple chips; check the loss still falls")
     p.add_argument("--seed", type=int, default=14)

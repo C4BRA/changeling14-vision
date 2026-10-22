@@ -21,6 +21,7 @@ import torch
 from ..model.encoder import count_parameters
 from ..progress import Progress, _write_json_atomic
 from .data import SpriteDataset
+from .text import TextTable
 from .train import _loader, model_from_checkpoint, pick_device
 from .watch import draw_watchset
 
@@ -59,6 +60,7 @@ def _predict(model, ds, device, batch, progress, stage):
     loader = _loader(ds, batch, False, 0, 0)
     rows = []
     done = 0
+    all_text = model.text_embeddings() if model.text_dim and len(model.text_vectors) else None
     for batch in loader:
         if progress.stop_requested:
             break
@@ -75,6 +77,11 @@ def _predict(model, ds, device, batch, progress, stage):
             row = {"cat": int(cat[i]), "cat_top5": top5[i].tolist(), "cat_conf": float(cp[i].max()),
                    "state": int(state[i]), "state_top5": stop5[i].tolist(),
                    "dir": int(direction[i]), "dir_pred": int(dirs[i])}
+            if all_text is not None and batch["text"][i] >= 0:
+                g = torch.nn.functional.normalize(out["global"][i:i + 1], dim=-1)
+                top = (g @ all_text.T).topk(min(5, all_text.shape[0]), dim=1).indices[0].cpu().tolist()
+                wanted = {int(r) for r in batch["text_rows"][i] if r >= 0}
+                row["text_hit"] = (top[0] in wanted, any(t in wanted for t in top))
             if batch["has_components"][i]:
                 p, t = comp_pred[i], comp_true[i]
                 row["comp"] = (int((p & t).sum()), int((p & ~t).sum()), int((~p & t).sum()))
@@ -93,6 +100,9 @@ def _scores(rows) -> dict:
     if st:
         out["state_top1"] = sum(r["state_top5"][0] == r["state"] for r in st) / len(st)
         out["state_top5"] = sum(r["state"] in r["state_top5"] for r in st) / len(st)
+    th = [r["text_hit"] for r in rows if "text_hit" in r]
+    if th:
+        out.update(text_n=len(th), text_top1=sum(a for a, _ in th) / len(th), text_top5=sum(b for _, b in th) / len(th))
     cr = [r["comp"] for r in rows if "comp" in r]
     if cr:
         tp, fp, fn = (sum(x[k] for x in cr) for k in range(3))
@@ -121,6 +131,8 @@ def _render_md(r: dict) -> str:
                   f"| Exact sprite, new direction or frame | {n['n']:,} | {n.get('state_top1', 0):.1%} | "
                   f"{n.get('state_top5', 0):.1%} |",
                   f"| Facing direction (four-way sprites) | | {n.get('direction_top1', 0):.1%} | |", "",
+                  f"Naming unseen-sheet sprites from all entity texts ({u.get('text_n', 0):,} linked sprites): "
+                  f"top-1 {u.get('text_top1', 0):.1%}, top-5 {u.get('text_top5', 0):.1%}.", "",
                   f"Entity components on unseen sheets ({u.get('components_n', 0):,} linked sprites): "
                   f"F1 {u.get('components_f1', 0):.2f}, precision {u.get('components_precision', 0):.2f}, "
                   f"recall {u.get('components_recall', 0):.2f}.", "",
@@ -151,9 +163,11 @@ def benchmark(model_dir: Path, data: Path, progress: Progress | None = None, che
 
     if not speed_only:
         index = json.loads((Path(ckpt.get("out", model_dir)) / "index.json").read_text())
-        unseen = _predict(model, SpriteDataset(data, index, "unseen", train=False, worn=False), dev, batch, progress,
+        text_file = Path(ckpt.get("out", model_dir)) / "text.npz"
+        text = TextTable(text_file) if model.text_dim and text_file.is_file() else None
+        unseen = _predict(model, SpriteDataset(data, index, "unseen", train=False, worn=False, text=text), dev, batch, progress,
                           "score unseen sheets")
-        newview = _predict(model, SpriteDataset(data, index, "newview", train=False, worn=False), dev, batch, progress,
+        newview = _predict(model, SpriteDataset(data, index, "newview", train=False, worn=False, text=text), dev, batch, progress,
                            "score new views")
         report["complete"] = not progress.stop_requested
         report["unseen"], report["newview"] = _scores(unseen), _scores(newview)
@@ -165,7 +179,7 @@ def benchmark(model_dir: Path, data: Path, progress: Progress | None = None, che
                                 "top1": sum(r["cat_top5"][0] == c for r in rows) / len(rows)})
         report["per_category"] = sorted(per_cat, key=lambda c: -c["n"])
         if progress.run_dir and unseen:
-            items = SpriteDataset(data, index, "unseen", train=False, worn=False).items
+            items = SpriteDataset(data, index, "unseen", train=False, worn=False, text=text).items
             wrong = sorted((i for i, r in enumerate(unseen) if r["cat_top5"][0] != r["cat"]),
                            key=lambda i: -unseen[i]["cat_conf"])[:24]
             draw_watchset(model, data, index, [items[i] for i in wrong], dev,
