@@ -51,6 +51,18 @@ class Options:
     seed: int = 14
 
 
+def git_origin(repo: Path) -> str | None:
+    """The checkout's GitHub-style name (owner/repo) from its origin remote, if any."""
+    try:
+        out = subprocess.run(["git", "-C", str(repo), "remote", "get-url", "origin"],
+                             capture_output=True, text=True, timeout=10, check=True)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    url = out.stdout.strip().removesuffix(".git").rstrip("/")
+    parts = url.replace(":", "/").split("/")
+    return "/".join(parts[-2:]) if len(parts) >= 2 and url else None
+
+
 def git_commit(repo: Path) -> str | None:
     try:
         out = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
@@ -248,7 +260,8 @@ def build(opts: Options, progress: Progress | None = None) -> dict:
     commit = git_commit(opts.repo)
     with open(out / "credits.md", "w", encoding="utf-8") as f:
         f.write("# Sprite credits\n\n")
-        f.write(f"Sprites from space-wizards/space-station-14 (commit {commit or 'unknown'}), "
+        source = git_origin(opts.repo) or opts.repo.name
+        f.write(f"Sprites from {source} (commit {commit or 'unknown'}), "
                 "used under the license stated for each sheet.\n\n")
         f.write("| Sheet | License | Copyright |\n|---|---|---|\n")
         for path in ordered:
@@ -260,7 +273,7 @@ def build(opts: Options, progress: Progress | None = None) -> dict:
     concrete = sum(1 for e in entities.values() if not e.abstract)
     report = {
         "complete": not stopped,
-        "source": {"repo": str(opts.repo), "commit": commit},
+        "source": {"repo": str(opts.repo), "origin": git_origin(opts.repo), "commit": commit},
         "sheets": {"total": len(sheets), "included": len(included), "excluded": len(excluded),
                    "excluded_by_reason": dict(Counter(excluded.values()).most_common()),
                    "by_license": dict(license_counts.most_common()),
