@@ -337,7 +337,7 @@ def train(opts: TrainOptions, progress: Progress | None = None) -> dict:
     newview_ds = _subset(SpriteDataset(opts.data, index, "newview", train=False, seed=opts.seed, worn=False,
                                        text=text), EVAL_LIMIT, opts.seed)
     loader = _loader(train_ds, opts.batch, True, opts.workers, opts.seed + step)
-    watch_items = pick_watchset(index, opts.seed, WATCHSET_SIZE)
+    watch_items = pick_watchset(index, opts.seed, WATCHSET_SIZE, named=text is not None)
 
     def checkpoint(reason: str) -> dict:
         # On a stop request, save straight away: the app kills the job after ~15 s.
@@ -371,7 +371,7 @@ def train(opts: TrainOptions, progress: Progress | None = None) -> dict:
                 f.write(json.dumps(row) + "\n")
         if progress.run_dir and reason != "stop":
             draw_watchset(model, opts.data, index, watch_items, device,
-                          progress.run_dir / "watchset" / name, seed=opts.seed)
+                          progress.run_dir / "watchset" / name, seed=opts.seed, text=text)
             _write_json_atomic(progress.run_dir / "watchset" / name / "meta.json",
                                {k: v for k, v in row.items() if v is not None})
         print(f"checkpoint {name}: " + ", ".join(
