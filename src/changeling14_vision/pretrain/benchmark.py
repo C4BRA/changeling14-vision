@@ -22,7 +22,7 @@ from ..model.encoder import count_parameters
 from ..progress import Progress, _write_json_atomic
 from .data import SpriteDataset
 from .text import TextTable
-from .train import _loader, model_from_checkpoint, pick_device
+from .train import _loader, model_from_checkpoint, newview_retrieval, pick_device, retrieval_sets
 from .watch import draw_watchset
 
 SPEED_SIZE = (480, 480)     # 15 x 15 tiles, the plan's reference frame
@@ -65,17 +65,19 @@ def _predict(model, ds, device, batch, progress, stage):
         if progress.stop_requested:
             break
         out = model(batch["x"].to(device))
-        c, s, d = out["category"], out["state"], out["direction"]
+        c, d = out["category"], out["direction"]
         cat, state, direction = batch["category"], batch["state"], batch["direction"]
         cp = c.softmax(1).cpu()
         top5 = c.topk(min(5, c.shape[1]), 1).indices.cpu()
-        stop5 = s.topk(min(5, s.shape[1]), 1).indices.cpu()
+        s = out.get("state")
+        stop5 = s.topk(min(5, s.shape[1]), 1).indices.cpu() if s is not None else None
         dirs = d.argmax(1).cpu()
         comp_pred = (out["components"] > 0).cpu()
         comp_true = batch["components"] > 0.5
         for i in range(len(cat)):
             row = {"cat": int(cat[i]), "cat_top5": top5[i].tolist(), "cat_conf": float(cp[i].max()),
-                   "state": int(state[i]), "state_top5": stop5[i].tolist(),
+                   "state": int(state[i]) if stop5 is not None else -1,
+                   "state_top5": stop5[i].tolist() if stop5 is not None else [],
                    "dir": int(direction[i]), "dir_pred": int(dirs[i])}
             if all_text is not None and batch["text"][i] >= 0:
                 g = torch.nn.functional.normalize(out["global"][i:i + 1], dim=-1)
@@ -171,6 +173,13 @@ def benchmark(model_dir: Path, data: Path, progress: Progress | None = None, che
                            "score new views")
         report["complete"] = not progress.stop_requested
         report["unseen"], report["newview"] = _scores(unseen), _scores(newview)
+        if model.state is None and not progress.stop_requested:
+            # Newer models have no per-sprite layer: same-sprite recognition is
+            # measured by looking each held-out view up among the training sprites.
+            progress.update("score new views", message="looking up each view among the training sprites", force=True)
+            queries, gallery = retrieval_sets(index, data, ckpt.get("options", {}).get("seed", 14), 10**9, text)
+            report["newview"].update(newview_retrieval(model, queries, gallery, batch, dev,
+                                                       lambda: progress.stop_requested))
         per_cat = []
         for c, name in enumerate(index["categories"]):
             rows = [r for r in unseen if r["cat"] == c]

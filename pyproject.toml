@@ -19,6 +19,7 @@ train = [
     "torch>=2.4",
     "numpy>=1.26",
     "safetensors>=0.4",
+    "schedulefree>=1.4",
 ]
 text = [
     "sentence-transformers>=3.0",

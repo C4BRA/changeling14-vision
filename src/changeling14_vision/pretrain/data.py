@@ -46,6 +46,10 @@ import numpy as np
 from PIL import Image
 
 CANVAS = 64
+TILE = 32               # the encoder's token size
+CELLS = (CANVAS // TILE) ** 2
+MOSAIC = 0.5            # share of training samples drawn as four-sprite canvases
+PAIR_FRACTION = 0.25    # share of a batch that also gets a second view (same-sprite loss)
 MAX_SPRITE = 64
 MIN_SPRITE = 8
 MIN_CATEGORY_SHEETS = 8
@@ -276,46 +280,91 @@ def _background(rng: random.Random, dataset: Path, floors: list[str], aug: Augme
     return Image.fromarray(arr, "RGB").convert("RGBA")
 
 
-def render(item: dict, dataset: Path, rng: random.Random, floors: list[str],
-           aug: Augment | None = None) -> np.ndarray:
-    """One training canvas as a (3, 64, 64) float32 array in [0, 1]."""
-    aug = aug or Augment()
+def _sprite(item: dict, dataset: Path, rng: random.Random, aug: Augment, limit: int = CANVAS) -> Image.Image:
+    """The sprite with zoom and rotation applied, at most limit x limit."""
     with Image.open(dataset / item["path"]) as img:
         sprite = img.convert("RGBA")
-    if aug.zoom and max(sprite.size) <= CANVAS // 2 and rng.random() < aug.zoom:
+    if aug.zoom and max(sprite.size) <= limit // 2 and rng.random() < aug.zoom:
         sprite = sprite.resize((sprite.width * 2, sprite.height * 2), Image.NEAREST)
     if aug.rotate and item["direction"] < 0 and rng.random() < aug.rotate:
         sprite = sprite.rotate(rng.uniform(0, 360), resample=Image.NEAREST, expand=True)
         box = sprite.getchannel("A").getbbox()
         if box:
             sprite = sprite.crop(box)
-        if max(sprite.size) > CANVAS:
-            sprite = sprite.crop((0, 0, min(sprite.width, CANVAS), min(sprite.height, CANVAS)))
-    canvas = _background(rng, dataset, floors, aug)
+    if max(sprite.size) > limit:
+        sprite = sprite.crop((0, 0, min(sprite.width, limit), min(sprite.height, limit)))
+    return sprite
+
+
+def _place(canvas: Image.Image, sprite: Image.Image, rng: random.Random, aug: Augment,
+           box: tuple[int, int, int] = (0, 0, CANVAS)) -> None:
+    left, top, size = box
     if aug.offset:
-        x = rng.randint(0, CANVAS - sprite.width)
-        y = rng.randint(0, CANVAS - sprite.height)
+        x, y = rng.randint(0, size - sprite.width), rng.randint(0, size - sprite.height)
     else:
-        x, y = (CANVAS - sprite.width) // 2, (CANVAS - sprite.height) // 2
-    canvas.alpha_composite(sprite, (x, y))
+        x, y = (size - sprite.width) // 2, (size - sprite.height) // 2
+    canvas.alpha_composite(sprite, (left + x, top + y))
+
+
+def _array(canvas: Image.Image) -> np.ndarray:
     arr = np.asarray(canvas.convert("RGB"), dtype=np.float32) / 255.0
     return arr.transpose(2, 0, 1).copy()
+
+
+def render(item: dict, dataset: Path, rng: random.Random, floors: list[str],
+           aug: Augment | None = None) -> np.ndarray:
+    """One training canvas as a (3, 64, 64) float32 array in [0, 1]."""
+    aug = aug or Augment()
+    sprite = _sprite(item, dataset, rng, aug)
+    canvas = _background(rng, dataset, floors, aug)
+    _place(canvas, sprite, rng, aug)
+    return _array(canvas)
+
+
+def render_mosaic(cells: list[dict | None], dataset: Path, rng: random.Random, floors: list[str],
+                  aug: Augment | None = None) -> np.ndarray:
+    """Up to four small sprites on one canvas, one inside each 32x32 tile
+    (row by row; None leaves a tile empty). A pretraining augmentation: more
+    labelled tiles per picture, and the per-tile output gets trained. It does
+    not try to look like a game scene."""
+    aug = aug or Augment()
+    canvas = _background(rng, dataset, floors, aug)
+    for n, item in enumerate(cells):
+        if item is not None:
+            r, c = divmod(n, CANVAS // TILE)
+            _place(canvas, _sprite(item, dataset, rng, aug, TILE), rng, aug, (c * TILE, r * TILE, TILE))
+    return _array(canvas)
 
 
 class SpriteDataset:
     """Map-style dataset usable by torch's DataLoader (no torch import here)."""
 
     def __init__(self, dataset: Path, index: dict, split: str, train: bool, seed: int = 14,
-                 worn: bool = True, text=None):
+                 worn: bool = True, text=None, mosaic: float | None = None, views: dict | None = None):
+        """mosaic: chance that a small sprite is drawn with up to three others,
+        one per tile (default MOSAIC when training, 0 otherwise; 1.0 gives a
+        fixed mosaic set for scoring tiles). views: (sheet, state) -> other
+        items of that sprite (directions, frames), for the second view."""
         self.dataset = Path(dataset)
-        self.items = [it for it in index["items"] if it["split"] == split and (worn or not it["worn"])]
         self.floors = floor_tiles(self.dataset, index)
         self.n_components = len(index.get("components", ()))
-        # Rows of the text table (pretrain/text.py) for the entities that draw each sprite.
-        self.text_rows = [text.rows_for(it.get("entities", [])) if text else [] for it in self.items]
+        self.text = text
         self.train = train
         self.seed = seed
         self.epoch = 0
+        self.mosaic = (MOSAIC if train else 0.0) if mosaic is None else mosaic
+        self.views = views or {}
+        self.use([it for it in index["items"] if it["split"] == split and (worn or not it["worn"])])
+
+    def use(self, items: list[dict]) -> "SpriteDataset":
+        """Set the items, and everything kept per item alongside them."""
+        self.items = items
+        # Rows of the text table (pretrain/text.py) for the entities that draw each sprite.
+        self.text_rows = [self.text.rows_for(it.get("entities", [])) if self.text else [] for it in items]
+        self.small = [i for i, it in enumerate(items) if it["w"] <= TILE and it["h"] <= TILE]
+        weights = self.weights()
+        self.small_weights = [weights[i] for i in self.small]
+        return self
 
     def weights(self) -> list[float]:
         """Sampling weights for training: worn overlays less often."""
@@ -323,6 +372,12 @@ class SpriteDataset:
 
     def __len__(self) -> int:
         return len(self.items)
+
+    def _rows(self, i: int) -> np.ndarray:
+        rows = self.text_rows[i][:MAX_TEXTS]
+        out = np.full(MAX_TEXTS, -1, dtype=np.int64)
+        out[:len(rows)] = rows
+        return out
 
     def __getitem__(self, i: int):
         item = self.items[i]
@@ -332,14 +387,50 @@ class SpriteDataset:
         else:
             rng = random.Random(self.seed * 1_000_003 + i)   # same canvas every evaluation
             aug = Augment(zoom=0.0, rotate=0.0)
+        tile_category = np.full(CELLS, -1, dtype=np.int64)
+        tile_rows = np.full((CELLS, MAX_TEXTS), -1, dtype=np.int64)
+        small = item["w"] <= TILE and item["h"] <= TILE
+        if small and self.small and rng.random() < self.mosaic:
+            # This sprite in a random tile, the others filled (or not) from the split.
+            picks: list[int | None] = [None] * CELLS
+            picks[rng.randrange(CELLS)] = i
+            for n in range(CELLS):
+                if picks[n] is None and rng.random() < 0.75:
+                    picks[n] = rng.choices(self.small, weights=self.small_weights)[0]
+            x = render_mosaic([self.items[j] if j is not None else None for j in picks],
+                              self.dataset, rng, self.floors, aug)
+            for n, j in enumerate(picks):
+                if j is not None:
+                    tile_category[n] = self.items[j]["category"]
+                    tile_rows[n] = self._rows(j)
+            # The whole-picture labels don't apply to four sprites at once.
+            return {"x": x, "x2": np.zeros_like(x), "pair": False, "category": -1, "state": -1,
+                    "direction": -1, "components": np.zeros(max(1, self.n_components), dtype=np.float32),
+                    "has_components": False, "text": -1, "text_rows": np.full(MAX_TEXTS, -1, dtype=np.int64),
+                    "tile_category": tile_category, "tile_rows": tile_rows}
         x = render(item, self.dataset, rng, self.floors, aug)
+        x2, pair = np.zeros_like(x), False
+        if self.train:
+            # A second look at the same sprite: another direction or frame when
+            # there is one, else the same picture placed and drawn differently.
+            others = self.views.get((item["sheet"], item["state"]), ())
+            other = rng.choice(others) if others and rng.random() < 0.5 else item
+            x2, pair = render(other, self.dataset, rng, self.floors, aug), True
         comps = np.zeros(max(1, self.n_components), dtype=np.float32)
         if item.get("components"):
             comps[item["components"]] = 1.0
         rows = self.text_rows[i]
-        all_rows = np.full(MAX_TEXTS, -1, dtype=np.int64)
-        all_rows[:len(rows[:MAX_TEXTS])] = rows[:MAX_TEXTS]
         text = (rng.choice(rows) if self.train else rows[0]) if rows else -1
-        return {"x": x, "category": item["category"], "state": item["state_id"], "direction": item["direction"],
-                "components": comps, "has_components": item.get("components") is not None,
-                "text": text, "text_rows": all_rows}
+        return {"x": x, "x2": x2, "pair": pair, "category": item["category"], "state": item["state_id"],
+                "direction": item["direction"], "components": comps,
+                "has_components": item.get("components") is not None, "text": text, "text_rows": self._rows(i),
+                "tile_category": tile_category, "tile_rows": tile_rows}
+
+
+def sprite_views(items: list[dict]) -> dict[tuple[str, str], list[dict]]:
+    """(sheet, state) -> its items, so a sprite's other directions and frames
+    can serve as a second view of it."""
+    views: dict[tuple[str, str], list[dict]] = {}
+    for it in items:
+        views.setdefault((it["sheet"], it["state"]), []).append(it)
+    return {k: v for k, v in views.items() if len(v) > 1}

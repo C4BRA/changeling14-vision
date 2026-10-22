@@ -320,3 +320,24 @@ def test_name_loss_counts_every_entity_and_skips_unnamed():
     loss.backward()
     assert torch.isfinite(loss) and g.grad[0].abs().sum() > 0
     assert g.grad[2].abs().sum() == 0            # no name: no pull either way
+
+
+def test_schedulefree_trains_resumes_and_benchmarks(tmp_path):
+    pytest.importorskip("schedulefree")
+    data = _fake_dataset(tmp_path / "ds")
+    out = tmp_path / "model"
+    args = ["train", "--data", str(data), "--out", str(out), "--size", "nano", "--batch", "8",
+            "--workers", "0", "--checkpoint-every", "3", "--device", "cpu", "--no-text",
+            "--optimizer", "schedulefree"]
+    assert main(args + ["--steps", "3"]) == 0
+    assert main(args + ["--steps", "5"]) == 0
+    ckpt = torch.load(out / "latest.pt", weights_only=False)
+    assert ckpt["step"] == 5 and ckpt["n_states"] == 0
+    row = json.loads((out / "metrics.jsonl").read_text().splitlines()[-1])
+    assert "unseen_tile_category_top1" in row
+    run = tmp_path / "run"
+    assert main(["--run-dir", str(run), "benchmark", "--data", str(data), "--out", str(out),
+                 "--size", "nano", "--device", "cpu"]) == 0
+    # A different optimiser can't continue this model.
+    with pytest.raises(SystemExit, match="schedulefree"):
+        main(args[:-1] + ["adamw", "--steps", "6"])

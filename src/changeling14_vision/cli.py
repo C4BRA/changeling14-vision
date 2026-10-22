@@ -93,7 +93,7 @@ def cmd_train(args) -> int:
     opts = TrainOptions(data=Path(args.data).expanduser().resolve(), out=_model_dir(args), size=args.size,
                         steps=args.steps, batch=args.batch, lr=args.lr, workers=args.workers,
                         checkpoint_every=args.checkpoint_every, checkpoint_minutes=args.checkpoint_minutes,
-                        minutes=args.minutes, device=args.device, seed=args.seed, fresh=args.fresh,
+                        optimizer=args.optimizer, minutes=args.minutes, device=args.device, seed=args.seed, fresh=args.fresh,
                         amp=args.amp, text_model=None if args.no_text else args.text_model)
     progress = Progress(args.run_dir)
     progress.catch_stop()
@@ -161,10 +161,15 @@ def main(argv: list[str] | None = None) -> int:
                                   f"else {DEFAULT_OUT}); a model folder keeps its catalogue for life")
     model_args(p)
     p.add_argument("--steps", type=int, default=20000, help="total optimizer steps (default 20000)")
-    p.add_argument("--batch", type=int, default=128)
-    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--batch", type=int, default=128,
+                   help="pictures per step (default 128); 256 or 512 run faster per picture on a GPU. The learning "
+                        "rate, warm-up and checkpoint spacing follow it; lower --steps to train on the same pictures")
+    p.add_argument("--lr", type=float, help="learning rate (default 1e-3 x sqrt(batch/128); 2e-3 schedule-free)")
+    p.add_argument("--optimizer", default="adamw", choices=["adamw", "schedulefree"],
+                   help="adamw with a cosine schedule (default), or schedule-free AdamW (no schedule: stop any time)")
     p.add_argument("--workers", type=int, default=2, help="data loading processes (default 2)")
-    p.add_argument("--checkpoint-every", type=int, default=1000, help="steps between checkpoints")
+    p.add_argument("--checkpoint-every", type=int,
+                   help="steps between checkpoints (default: every 128,000 pictures, 1,000 steps at batch 128)")
     p.add_argument("--checkpoint-minutes", type=float, default=15.0,
                    help="also checkpoint at least this often (default 15)")
     p.add_argument("--minutes", type=float, help="stop cleanly after this many minutes; run again to resume")
