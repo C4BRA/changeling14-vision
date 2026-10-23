@@ -250,7 +250,7 @@ def test_replay_dataset_shrinks_marks_dark_and_holds_out_rounds(tmp_path):
             a[:, :672] = shade
             Image.fromarray(a).save(frames / f"{i:05d}-5.png")
             ents = [{"uid": k, "prototype": "WallSolid", "name": "wall", "center": [32 + 700 * k, 32],
-                     "box": [700 * k, 0, 700 * k + 64, 64], "draw_depth": -10, "rotation": 0, "blocked": False,
+                     "box": [700 * k, 0, 700 * k + 64, 64], "draw_depth": -2, "rotation": 0, "blocked": False,
                      "alive": False, "humanoid": False, "subject": False} for k in range(2)]
             (frames / f"{i:05d}-5.json").write_text(json.dumps(
                 {"picture": f"{i:05d}-5.png", "tick": i, "time": i * 30.0, "subject": 5, "eye_rotation": 0,
@@ -264,7 +264,19 @@ def test_replay_dataset_shrinks_marks_dark_and_holds_out_rounds(tmp_path):
     lit, dark = f["sprites"]
     assert lit["box"] == [0.0, 0.0, 32.0, 32.0] and lit["visible"]
     assert dark["dark"] and not dark["visible"]
+    assert not lit["faint"]
     assert (tmp_path / "out" / "report.html").is_file()
+
+
+def test_contrast_marks_floor_coloured_sprites():
+    import numpy as np
+
+    from changeling14_vision.replays.dataset import FAINT, _contrast
+
+    floor = np.full((96, 96, 3), 0.4, np.float32)
+    assert _contrast(floor, 32, 32, 64, 64) < FAINT
+    floor[40:56, 40:56] = 0.9            # a pale splat in the middle tile
+    assert _contrast(floor, 32, 32, 64, 64) > FAINT
 
 
 def test_detect_trains_from_a_stage1_model(tmp_path):

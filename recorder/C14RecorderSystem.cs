@@ -21,6 +21,7 @@ using Content.Shared.Examine;
 using Content.Shared.Humanoid;
 using Content.Shared.Mobs.Components;
 using Content.Shared.Mobs.Systems;
+using Content.Shared.SubFloor;
 using Robust.Client;
 using Robust.Client.GameObjects;
 using Robust.Client.Graphics;
@@ -311,6 +312,7 @@ public sealed partial class C14RecorderSystem : EntitySystem
         public bool Blocked;
         public bool Alive;
         public bool Humanoid;
+        public bool UnderFloor;
     }
 
     private List<Seen> Describe(Job job, IEye eye, EntityUid subject, Matrix3x2 worldToPicture)
@@ -353,6 +355,7 @@ public sealed partial class C14RecorderSystem : EntitySystem
                 Blocked = blocked,
                 Alive = TryComp<MobStateComponent>(uid, out var mob) && _mobs.IsAlive(uid, mob),
                 Humanoid = HasComp<HumanoidProfileComponent>(uid),
+                UnderFloor = TryComp<SubFloorHideComponent>(uid, out var subfloor) && subfloor.IsUnderCover,
             });
         }
         return seen;
@@ -410,6 +413,7 @@ public sealed partial class C14RecorderSystem : EntitySystem
             sb.Append(",\"blocked\":").Append(e.Blocked ? "true" : "false");
             sb.Append(",\"alive\":").Append(e.Alive ? "true" : "false");
             sb.Append(",\"humanoid\":").Append(e.Humanoid ? "true" : "false");
+            sb.Append(",\"under_floor\":").Append(e.UnderFloor ? "true" : "false");
             sb.Append(",\"subject\":").Append(e.Uid == subject ? "true" : "false");
             sb.Append('}');
         }

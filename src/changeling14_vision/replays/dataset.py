@@ -13,6 +13,8 @@ stands, which differs for wall-mounted things) and three flags:
   blocked   a wall is in the way (from the recorder)
   dark      the box is almost black in the picture: unlit, or outside the
             player's view cone
+  faint     a floor-level sprite (puddle, cable, pipe, decal) that is under a
+            floor tile or looks just like the floor around it
   visible   neither of the above: the player can actually see it
 
 Nothing is dropped for being blocked or dark, so the model also learns what
@@ -35,6 +37,8 @@ from PIL import Image
 TILE = 32
 DARK = 12 / 255           # mean brightness below this counts as dark
 REPEAT = 4 / 255          # mean difference below this counts as a repeat
+FAINT = 12 / 255          # floor-level sprites differing less than this from around them can't be seen
+FLOOR_LEVEL = -5          # draw depths up to HighFloorObjects (puddles, pipes, cables, decals)
 BLACK = 0.95              # pictures with more near-black pixels than this show nothing to learn
 
 
@@ -58,6 +62,18 @@ def _scale(key: dict) -> int | None:
     if w % VIEW[0] or w // VIEW[0] * VIEW[1] != h:
         return None
     return w // VIEW[0]
+
+
+def _contrast(pixels: np.ndarray, x0: int, y0: int, x1: int, y1: int) -> float:
+    """Mean difference between a box and the median colour of the tile-wide ring around it."""
+    h, w = pixels.shape[:2]
+    rx0, ry0, rx1, ry1 = max(0, x0 - TILE), max(0, y0 - TILE), min(w, x1 + TILE), min(h, y1 + TILE)
+    ring = np.ones((ry1 - ry0, rx1 - rx0), bool)
+    ring[y0 - ry0:y1 - ry0, x0 - rx0:x1 - rx0] = False
+    if not ring.any():
+        return 1.0
+    around = np.median(pixels[ry0:ry1, rx0:rx1][ring], axis=0)
+    return float(np.abs(pixels[y0:y1, x0:x1] - around).mean())
 
 
 def _thumb(img: Image.Image) -> np.ndarray:
@@ -120,6 +136,10 @@ def build_dataset(recordings: list[Path], out: Path, library_rows: dict[str, dic
             if cx1 - cx0 < 2 or cy1 - cy0 < 2:       # (almost) outside the picture
                 continue
             dark = float(pixels[cy0:cy1, cx0:cx1].mean()) < DARK
+            # Floor-level things (puddles, cables, pipes, decals) can be drawn but
+            # not seen: under a floor tile, dried to a speck, or floor-coloured.
+            faint = bool(e.get("under_floor")) or (
+                e["draw_depth"] <= FLOOR_LEVEL and _contrast(pixels, cx0, cy0, cx1, cy1) < FAINT)
             sprites.append({
                 "prototype": e["prototype"], "name": e["name"],
                 "box": [round(x0, 1), round(y0, 1), round(x1, 1), round(y1, 1)],
@@ -128,7 +148,7 @@ def build_dataset(recordings: list[Path], out: Path, library_rows: dict[str, dic
                 "center": [round((x0 + x1) / 2, 1), round((y0 + y1) / 2, 1)],
                 "origin": [round(e["center"][0] / s, 1), round(e["center"][1] / s, 1)],
                 "draw_depth": e["draw_depth"], "blocked": e["blocked"], "dark": dark,
-                "visible": not e["blocked"] and not dark,
+                "faint": faint, "visible": not e["blocked"] and not dark and not faint,
                 "humanoid": e["humanoid"], "alive": e["alive"], "subject": e["subject"],
             })
         rel = Path("frames") / rec.name / key["picture"]
@@ -147,6 +167,7 @@ def build_dataset(recordings: list[Path], out: Path, library_rows: dict[str, dic
         "test_frames": sum(f["split"] == "test" for f in frames),
         "sprites": sum(len(f["sprites"]) for f in frames),
         "visible_sprites": sum(sum(s["visible"] for s in f["sprites"]) for f in frames),
+        "faint_sprites": sum(sum(s.get("faint", False) for s in f["sprites"]) for f in frames),
     }
     out.mkdir(parents=True, exist_ok=True)
     tmp = out / "dataset.json.tmp"
