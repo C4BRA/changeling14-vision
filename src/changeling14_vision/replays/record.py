@@ -106,6 +106,15 @@ def _client_command(client: Path) -> list[str]:
     return ["dotnet", str(dll), "--cvar", "replay.ignore_errors=true", "--cvar", "audio.mastervolume=0"]
 
 
+def _first_line(path: Path) -> str | None:
+    """The file's first line, or None while it is missing or being rewritten."""
+    try:
+        lines = path.read_text(errors="replace").splitlines()
+    except OSError:
+        return None
+    return lines[0] if lines else None
+
+
 def write_job(path: Path, **settings) -> None:
     lines = [f"{k}={v}" for k, v in settings.items() if v is not None]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -121,7 +130,9 @@ def record(replay: Path, client: Path, out: Path, interval_s: float = 30, player
     if (root / "job.txt").exists():
         raise RecordError(f"{root / 'job.txt'} already exists: another recording may be running "
                           "(delete it if not)")
-    shutil.rmtree(root / "out", ignore_errors=True)
+    if (root / "out").is_dir() and any((root / "out").iterdir()):
+        # Pictures from a recording that was never collected: keep them.
+        raise RecordError(f"{root / 'out'} still holds pictures from an earlier recording; move them out first")
     for name in ("done.txt", "error.txt", "progress.txt"):
         (root / name).unlink(missing_ok=True)
     root.mkdir(parents=True, exist_ok=True)
@@ -134,14 +145,15 @@ def record(replay: Path, client: Path, out: Path, interval_s: float = 30, player
     frames = out / "frames"
     frames.mkdir(exist_ok=True)
     started = time.time()
+    proc = None
     try:
         with open(out / "client.log", "w", encoding="utf-8") as client_log:
             proc = subprocess.Popen(_client_command(client), cwd=client, stdout=client_log,
                                     stderr=subprocess.STDOUT)
+            note = "starting the client"
             while proc.poll() is None:
                 time.sleep(2)
-                note = (root / "progress.txt").read_text(errors="replace").splitlines()[0] \
-                    if (root / "progress.txt").is_file() else "starting the client"
+                note = _first_line(root / "progress.txt") or note
                 saved = len(list((root / "out").glob("*.png"))) if (root / "out").is_dir() else 0
                 if progress:
                     progress.update("record", saved, max_pictures or 0, f"{replay.name}: {note}")
@@ -156,6 +168,8 @@ def record(replay: Path, client: Path, out: Path, interval_s: float = 30, player
         error = (root / "error.txt").read_text(errors="replace") if (root / "error.txt").is_file() else None
         finished = (root / "done.txt").is_file()
     finally:
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
         # Only remove the copies made here; the library is never touched.
         (root / "job.txt").unlink(missing_ok=True)
         (root / "replay.zip").unlink(missing_ok=True)
