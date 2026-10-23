@@ -21,6 +21,9 @@ DEFAULT_OUT = "~/Desktop/SS13-14/ss14-sprite-dataset"
 DEFAULT_MODELS = "~/Desktop/SS13-14/changeling14-models"
 DEFAULT_INBOX = "~/Desktop/SS13-14/replay-inbox"
 DEFAULT_LIBRARY = "~/Desktop/SS13-14/replay-library"
+DEFAULT_CODEBASE = "~/Desktop/SS13-14/wizden-ss14"
+DEFAULT_CLIENTS = "~/Desktop/SS13-14/replay-clients"
+DEFAULT_RECORDINGS = "~/Desktop/SS13-14/replay-recordings"
 TRAIN_DEPS = 'the training steps need PyTorch: pip install -e ".[train]"'
 
 
@@ -182,6 +185,38 @@ def cmd_replays_list(args) -> int:
     return 0
 
 
+def cmd_replays_record(args) -> int:
+    from .replays.importer import load_library
+    from .replays.record import RecordError, prepare_client, record
+
+    library = Path(args.library).expanduser()
+    rows = load_library(library)
+    wanted = Path(args.replay).name
+    row = next((r for r in rows if Path(r["file"]).name == wanted or r["original"] == wanted), None)
+    if row is None:
+        print(f"{wanted} is not in the library {library}; import it first", flush=True)
+        return 1
+    progress = Progress(args.run_dir)
+    progress.catch_stop()
+    try:
+        progress.update("build client", 0, 1, f"build {row['build']}", force=True)
+        client = prepare_client(row["buildForkVersion"], row["build"], Path(args.source),
+                                Path(args.clients), log=lambda m: print(m, flush=True))
+        out = Path(args.out).expanduser() / Path(row["file"]).stem
+        result = record(library / row["file"], client, out, interval_s=args.interval,
+                        players_per_moment=args.players, max_pictures=args.max_pictures,
+                        start_s=args.start, end_s=args.end, seed=args.seed, progress=progress,
+                        log=lambda m: print(m, flush=True))
+    except RecordError as exc:
+        print(f"record failed: {exc}", flush=True)
+        return 1
+    print(f"recorded {result['pictures']} picture(s) from {result['replay']} in {result['seconds']} s "
+          f"-> {out}", flush=True)
+    if result["error"]:
+        print(f"the recorder reported an error (see {out / 'error.txt'})", flush=True)
+    return 0 if result["finished"] and not result["error"] else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="changeling14-vision")
     parser.add_argument("--run-dir", help="report progress here (default: $C14_RUN_DIR)")
@@ -266,6 +301,21 @@ def main(argv: list[str] | None = None) -> int:
     r = rsub.add_parser("list", help="replays in the library, grouped by the build that plays them")
     r.add_argument("--library", default=DEFAULT_LIBRARY, help=f"replay library (default {DEFAULT_LIBRARY})")
     r.set_defaults(func=cmd_replays_list)
+    r = rsub.add_parser("record", help="play a library replay in a replay client and save pictures with answer keys")
+    r.add_argument("replay", help="the replay's file name in the library")
+    r.add_argument("--library", default=DEFAULT_LIBRARY, help=f"replay library (default {DEFAULT_LIBRARY})")
+    r.add_argument("--source", default=DEFAULT_CODEBASE,
+                   help=f"git checkout of the codebase the replay came from (default {DEFAULT_CODEBASE})")
+    r.add_argument("--clients", default=DEFAULT_CLIENTS,
+                   help=f"where replay clients are built, one per build (default {DEFAULT_CLIENTS})")
+    r.add_argument("--out", default=DEFAULT_RECORDINGS, help=f"output folder (default {DEFAULT_RECORDINGS})")
+    r.add_argument("--interval", type=float, default=30, help="seconds of replay between moments (default 30)")
+    r.add_argument("--players", type=int, default=2, help="players followed at each moment (default 2)")
+    r.add_argument("--max-pictures", type=int, help="stop after this many pictures")
+    r.add_argument("--start", type=float, help="first second of the replay to record")
+    r.add_argument("--end", type=float, help="last second of the replay to record")
+    r.add_argument("--seed", type=int, default=1, help="picks which players are followed (default 1)")
+    r.set_defaults(func=cmd_replays_record)
 
     args = parser.parse_args(argv)
     return args.func(args)
