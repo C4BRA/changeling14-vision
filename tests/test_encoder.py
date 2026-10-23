@@ -435,3 +435,28 @@ def test_dedup_counts_identical_pictures_once(tmp_path):
     write_report(index, data, tmp_path / "duplicates.html")
     page = (tmp_path / "duplicates.html").read_text()
     assert "Biggest groups" in page and "moved into training" in page and "data:image/png" in page
+
+
+def test_held_out_names_are_never_pushed_away():
+    from changeling14_vision.pretrain.train import PretrainModel, _every_name_loss, _name_hits
+    from changeling14_vision.model.encoder import build_encoder
+    torch.manual_seed(0)
+    model = PretrainModel(build_encoder("nano"), 3, 4, 2, text_dim=8)
+    # Rows 0 and 2 share a name; row 4 is a name only held-out pictures carry.
+    model.set_text(torch.randn(5, 8), ["crowbar. red", "wrench. x", "Crowbar. blue", "door. y", "new thing. z"])
+    model.hide_names({4})
+    all_t = model.text_embeddings().detach()
+    z = torch.nn.functional.normalize(torch.randn(2, EMBED_DIM), dim=-1).requires_grad_()
+    loss = _every_name_loss(model, z, torch.tensor([[0, -1], [1, -1]]), model.text_embeddings())
+    loss.backward()
+    # The hidden row adds nothing: even placed right on a picture, it changes no loss.
+    wanted = torch.tensor([[0, -1], [1, -1]])
+    moved = all_t.clone()
+    moved[4] = z[0].detach()
+    before = _every_name_loss(model, z.detach(), wanted, all_t)
+    assert torch.isfinite(loss) and torch.allclose(before, _every_name_loss(model, z.detach(), wanted, moved))
+    # A guess of the same name with another description counts as right.
+    r = _name_hits(all_t[2:3], torch.tensor([[0, -1]]), all_t, model.text_name_ids, model.name_mask)
+    assert r["h1"].item() and r["known"].item()
+    r = _name_hits(all_t[4:5], torch.tensor([[4, -1]]), all_t, model.text_name_ids, model.name_mask)
+    assert r["h1"].item() and not r["known"].item()

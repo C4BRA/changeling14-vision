@@ -56,11 +56,14 @@ def time_encoder(encoder, device, size=SPEED_SIZE, runs: int = 30) -> dict:
 
 
 @torch.no_grad()
-def _predict(model, ds, device, batch, progress, stage):
+def _predict(model, ds, device, batch, progress, stage, known: set[int] | None = None):
+    """known: text rows some training picture carries, to split naming into
+    items training showed and items it never did."""
     loader = _loader(ds, batch, False, 0, 0)
     rows = []
     done = 0
     all_text = model.text_embeddings() if model.text_dim and len(model.text_vectors) else None
+    name_of = model.text_name_ids.cpu().tolist() if len(model.text_name_ids) else None
     for batch in loader:
         if progress.stop_requested:
             break
@@ -82,8 +85,12 @@ def _predict(model, ds, device, batch, progress, stage):
             if all_text is not None and batch["text"][i] >= 0:
                 g = torch.nn.functional.normalize(out["global"][i:i + 1], dim=-1)
                 top = (g @ all_text.T).topk(min(5, all_text.shape[0]), dim=1).indices[0].cpu().tolist()
-                wanted = {int(r) for r in batch["text_rows"][i] if r >= 0}
+                rows_wanted = {int(r) for r in batch["text_rows"][i] if r >= 0}
+                wanted = {name_of[r] for r in rows_wanted} if name_of else rows_wanted
+                top = [name_of[t] for t in top] if name_of else top        # the right name counts
                 row["text_hit"] = (top[0] in wanted, any(t in wanted for t in top))
+                if known is not None:
+                    row["known_item"] = bool(rows_wanted & known)
             if batch["has_components"][i]:
                 p, t = comp_pred[i], comp_true[i]
                 row["comp"] = (int((p & t).sum()), int((p & ~t).sum()), int((~p & t).sum()))
@@ -105,6 +112,11 @@ def _scores(rows) -> dict:
     th = [r["text_hit"] for r in rows if "text_hit" in r]
     if th:
         out.update(text_n=len(th), text_top1=sum(a for a, _ in th) / len(th), text_top5=sum(b for _, b in th) / len(th))
+    for key, flag in (("known", True), ("new", False)):
+        th = [r["text_hit"] for r in rows if "text_hit" in r and r.get("known_item") is flag]
+        if th:
+            out.update({f"text_{key}_n": len(th), f"text_{key}_top1": sum(a for a, _ in th) / len(th),
+                        f"text_{key}_top5": sum(b for _, b in th) / len(th)})
     cr = [r["comp"] for r in rows if "comp" in r]
     if cr:
         tp, fp, fn = (sum(x[k] for x in cr) for k in range(3))
@@ -135,6 +147,11 @@ def _render_md(r: dict) -> str:
                   f"| Facing direction (four-way sprites) | | {n.get('direction_top1', 0):.1%} | |", "",
                   *([f"Naming unseen-sheet sprites from all entity texts ({u['text_n']:,} linked sprites): "
                      f"top-1 {u['text_top1']:.1%}, top-5 {u['text_top5']:.1%}.", ""] if "text_n" in u else []),
+                  *([f"Of those, items no training picture shows ({u['text_new_n']:,}): top-5 {u['text_new_top5']:.1%}; "
+                     f"items also shown in other training sheets ({u.get('text_known_n', 0):,}): "
+                     f"top-5 {u.get('text_known_top5', 0):.1%}.", ""] if "text_new_n" in u else []),
+                  *([f"Naming new views of training sprites ({n['text_n']:,}): top-1 {n['text_top1']:.1%}, "
+                     f"top-5 {n['text_top5']:.1%}.", ""] if "text_n" in n else []),
                   f"Entity components on unseen sheets ({u.get('components_n', 0):,} linked sprites): "
                   f"F1 {u.get('components_f1', 0):.2f}, precision {u.get('components_precision', 0):.2f}, "
                   f"recall {u.get('components_recall', 0):.2f}.", "",
@@ -167,10 +184,12 @@ def benchmark(model_dir: Path, data: Path, progress: Progress | None = None, che
         index = json.loads((Path(ckpt.get("out", model_dir)) / "index.json").read_text())
         text_file = Path(ckpt.get("out", model_dir)) / "text.npz"
         text = TextTable(text_file) if model.text_dim and text_file.is_file() else None
+        known = ({r for it in index["items"] if it["split"] == "train" for r in text.rows_for(it.get("entities", []))}
+                 if text else None)
         unseen = _predict(model, SpriteDataset(data, index, "unseen", train=False, worn=False, text=text), dev, batch, progress,
-                          "score unseen sheets")
+                          "score unseen sheets", known)
         newview = _predict(model, SpriteDataset(data, index, "newview", train=False, worn=False, text=text), dev, batch, progress,
-                           "score new views")
+                           "score new views", known)
         report["complete"] = not progress.stop_requested
         report["unseen"], report["newview"] = _scores(unseen), _scores(newview)
         if model.state is None and not progress.stop_requested:

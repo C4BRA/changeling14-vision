@@ -104,11 +104,29 @@ class PretrainModel(nn.Module):
             # Temperature of the comparison against every entity text.
             self.name_scale = nn.Parameter(torch.tensor(math.log(20.0)))
         self.register_buffer("text_vectors", torch.zeros(0, max(1, text_dim)), persistent=False)
+        # Per text row: an id shared by rows with the same name (a guess of
+        # either counts as right), and whether training may use it as a wrong
+        # answer (texts only held-out pictures show are left out).
+        self.register_buffer("text_name_ids", torch.zeros(0, dtype=torch.long), persistent=False)
+        self.register_buffer("name_mask", torch.zeros(0, dtype=torch.bool), persistent=False)
 
     def set_text(self, vectors, texts: list[str] | None = None) -> None:
         self.text_vectors = torch.as_tensor(vectors, dtype=torch.float32, device=self.category.weight.device)
         # Entity names, for captions: "name. description" -> "name".
         self.text_names = [t.split(". ", 1)[0] for t in texts] if texts else None
+        if self.text_names:
+            ids: dict[str, int] = {}
+            self.text_name_ids = torch.tensor([ids.setdefault(n.lower(), len(ids)) for n in self.text_names],
+                                              device=self.text_vectors.device)
+
+    def hide_names(self, rows: set[int]) -> None:
+        """Keep these text rows out of the training comparison: names only
+        held-out pictures carry would otherwise be pushed away on every step,
+        so the model would learn never to say them."""
+        mask = torch.ones(len(self.text_vectors), dtype=torch.bool, device=self.text_vectors.device)
+        if rows:
+            mask[sorted(rows)] = False
+        self.name_mask = mask
 
     def text_embeddings(self, rows: torch.Tensor | None = None) -> torch.Tensor:
         t = self.text_vectors if rows is None else self.text_vectors[rows]
@@ -238,6 +256,8 @@ def _every_name_loss(model: PretrainModel, z: torch.Tensor, wanted: torch.Tensor
     right rows padded with -1. Rows with none add nothing."""
     m = (wanted >= 0).any(1).float()
     every = z @ all_t.T * model.name_scale.exp()                         # (N, texts)
+    if model.name_mask.numel() == every.shape[1]:
+        every = every.masked_fill(~model.name_mask, -1e4)
     right = torch.zeros_like(every, dtype=torch.bool)
     right.scatter_(1, wanted.clamp(min=0), wanted >= 0)
     right[:, 0] |= ~right.any(1)          # rows with no name: any target, masked out below
@@ -364,25 +384,37 @@ def _memory_note(device) -> str:
     return ""
 
 
-def _name_hits(z: torch.Tensor, wanted: torch.Tensor, all_text: torch.Tensor) -> tuple[int, int, int]:
-    """(top-1 hits, top-5 hits, n) of unit vectors z against every text."""
+def _name_hits(z: torch.Tensor, wanted: torch.Tensor, all_text: torch.Tensor,
+               name_ids: torch.Tensor | None = None, known: torch.Tensor | None = None) -> dict:
+    """Top-1/top-5 hits of unit vectors z against every text. A guess with
+    the right name counts even if its description differs (name_ids). With
+    known (a bool per text row: some training picture has it), the counts
+    are split into items training showed and items it never did."""
     m = (wanted >= 0).any(1)
     if not m.any():
-        return 0, 0, 0
+        return {}
+    w = wanted[m]
     top = (z[m] @ all_text.T).topk(min(5, all_text.shape[0]), dim=1).indices      # (n, 5)
-    hit = (top[:, :, None] == wanted[m][:, None, :]).any(-1)                      # (n, 5)
-    return hit[:, 0].sum().item(), hit.any(1).sum().item(), int(m.sum())
+    if name_ids is not None and len(name_ids) == all_text.shape[0]:
+        top, w = name_ids[top], torch.where(w >= 0, name_ids[w.clamp(min=0)], -1)
+    hit = (top[:, :, None] == w[:, None, :]).any(-1)                              # (n, 5)
+    out = {"h1": hit[:, 0], "h5": hit.any(1)}
+    if known is not None and len(known) == all_text.shape[0]:
+        out["known"] = (known[wanted[m].clamp(min=0)] & (wanted[m] >= 0)).any(1)
+    return out
 
 
 @torch.no_grad()
-def evaluate(model: PretrainModel, loader, device, stop=lambda: False) -> dict:
+def evaluate(model: PretrainModel, loader, device, stop=lambda: False, known: torch.Tensor | None = None) -> dict:
     """Top-1/top-5 on whichever labels the split has (whole pictures, and
     tiles of four-sprite canvases)."""
     model.eval()
     n_cat = n_state = n_dir = n_txt = n_tile = n_ttxt = 0
     cat1 = cat5 = st1 = st5 = dir1 = tx1 = tx5 = tile1 = ttx1 = ttx5 = 0
     tp = fp = fn = 0
+    split = {k: [0, 0, 0] for k in ("known", "new")}       # top-1 hits, top-5 hits, n
     all_text = model.text_embeddings() if model.text_dim and len(model.text_vectors) else None
+    name_ids = model.text_name_ids if len(model.text_name_ids) else None
     for batch in loader:
         if stop():
             break
@@ -391,11 +423,18 @@ def evaluate(model: PretrainModel, loader, device, stop=lambda: False) -> dict:
         out = model(b["x"])
         c, d = out["category"], out["direction"]
         if all_text is not None:
-            h1, h5, n = _name_hits(F.normalize(out["global"], dim=-1), b["text_rows"], all_text)
-            tx1, tx5, n_txt = tx1 + h1, tx5 + h5, n_txt + n
+            r = _name_hits(F.normalize(out["global"], dim=-1), b["text_rows"], all_text, name_ids, known)
+            if r:
+                tx1, tx5, n_txt = tx1 + r["h1"].sum().item(), tx5 + r["h5"].sum().item(), n_txt + len(r["h1"])
+                if "known" in r:
+                    for key, sel in (("known", r["known"]), ("new", ~r["known"])):
+                        split[key][0] += r["h1"][sel].sum().item()
+                        split[key][1] += r["h5"][sel].sum().item()
+                        split[key][2] += int(sel.sum())
             zt = F.normalize(out["tiles"].flatten(0, 1), dim=-1)
-            h1, h5, n = _name_hits(zt, b["tile_rows"].flatten(0, 1), all_text)
-            ttx1, ttx5, n_ttxt = ttx1 + h1, ttx5 + h5, n_ttxt + n
+            r = _name_hits(zt, b["tile_rows"].flatten(0, 1), all_text, name_ids)
+            if r:
+                ttx1, ttx5, n_ttxt = ttx1 + r["h1"].sum().item(), ttx5 + r["h5"].sum().item(), n_ttxt + len(r["h1"])
         tc = b["tile_category"].flatten()
         mt = tc >= 0
         if mt.any():
@@ -435,6 +474,10 @@ def evaluate(model: PretrainModel, loader, device, stop=lambda: False) -> dict:
         out.update(direction_top1=dir1 / n_dir)
     if n_txt:
         out.update(text_top1=tx1 / n_txt, text_top5=tx5 / n_txt, text_n=n_txt)
+    for key, (h1, h5, n) in split.items():
+        if n:
+            # known: items some training picture shows (from another sheet); new: items it never showed.
+            out.update({f"text_{key}_top1": h1 / n, f"text_{key}_top5": h5 / n, f"text_{key}_n": n})
     if n_tile:
         out.update(tile_category_top1=tile1 / n_tile, tile_n=n_tile)
     if n_ttxt:
@@ -553,8 +596,16 @@ def train(opts: TrainOptions, progress: Progress | None = None) -> dict:
 
     device = pick_device(opts.device)
     model = build_model(opts.size, index, text.dim if text else 0).to(device)
+    known = None
     if text:
         model.set_text(text.vectors, text.texts)
+        # Only names some training picture carries are wrong answers to learn
+        # from; the rest (held-out items, items with no picture) stay neutral.
+        trained = {r for it in index["items"] if it["split"] == "train" for r in text.rows_for(it.get("entities", []))}
+        model.hide_names(set(range(len(text.texts))) - trained)
+        known = model.name_mask.clone()
+        print(f"train: {len(trained):,} of {len(text.texts):,} names are training answers; "
+              "the others are never pushed away", flush=True)
     average = WeightAverage(model, opts.ema)
     decay = [p for n, p in model.named_parameters() if p.ndim >= 2]
     no_decay = [p for n, p in model.named_parameters() if p.ndim < 2]
@@ -613,8 +664,10 @@ def train(opts: TrainOptions, progress: Progress | None = None) -> dict:
         if reason != "stop":
             progress.update("evaluate", step, opts.steps, "scoring held-out sprites", force=True)
             stop = lambda: progress.stop_requested
-            scores = {"unseen": evaluate(average.model, _loader(unseen_ds, opts.batch, False, 0, 0), device, stop),
-                      "newview": evaluate(average.model, _loader(newview_ds, opts.batch, False, 0, 0), device, stop),
+            scores = {"unseen": evaluate(average.model, _loader(unseen_ds, opts.batch, False, 0, 0), device, stop,
+                                         known),
+                      "newview": evaluate(average.model, _loader(newview_ds, opts.batch, False, 0, 0), device, stop,
+                                          known),
                       "tiles": evaluate(average.model, _loader(unseen_tiles, opts.batch, False, 0, 0), device, stop)}
             if model.state is None:
                 scores["newview"].update(newview_retrieval(average.model, queries, gallery, opts.batch, device, stop))
@@ -634,6 +687,9 @@ def train(opts: TrainOptions, progress: Progress | None = None) -> dict:
                "unseen_components_f1": scores["unseen"].get("components_f1"),
                "unseen_text_top1": scores["unseen"].get("text_top1"),
                "unseen_text_top5": scores["unseen"].get("text_top5"),
+               "unseen_new_item_text_top5": scores["unseen"].get("text_new_top5"),
+               "unseen_known_item_text_top5": scores["unseen"].get("text_known_top5"),
+               "newview_text_top5": scores["newview"].get("text_top5"),
                "newview_state_top1": scores["newview"].get("state_top1"),
                "newview_state_top5": scores["newview"].get("state_top5"),
                "newview_direction_top1": scores["newview"].get("direction_top1"),
