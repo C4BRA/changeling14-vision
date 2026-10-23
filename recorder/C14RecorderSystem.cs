@@ -338,9 +338,7 @@ public sealed partial class C14RecorderSystem : EntitySystem
             if (max.X - min.X < 1 || max.Y - min.Y < 1)
                 continue;
 
-            var target = new MapCoordinates(worldPos, xform.MapID);
-            var blocked = uid != subject &&
-                          !_examine.InRangeUnOccluded(eyeMap, target, job.VisionRange, e => e == uid || e == subject);
+            var blocked = uid != subject && !CanSee(job, eyeMap, uid, subject, worldPos, bounds);
 
             seen.Add(new Seen
             {
@@ -358,6 +356,24 @@ public sealed partial class C14RecorderSystem : EntitySystem
             });
         }
         return seen;
+    }
+
+    // A wall's own centre is often hidden behind the next wall along, even when
+    // its face is in plain view, so a sprite counts as seen when a line from the
+    // eye reaches its centre or any point near its corners.
+    private bool CanSee(Job job, MapCoordinates eye, EntityUid uid, EntityUid subject, Vector2 worldPos,
+        Box2Rotated bounds)
+    {
+        var centre = bounds.Center;
+        var points = new[] { worldPos, bounds.BottomLeft, bounds.BottomRight, bounds.TopLeft, bounds.TopRight };
+        for (var i = 0; i < points.Length; i++)
+        {
+            var point = i == 0 ? points[i] : Vector2.Lerp(centre, points[i], 0.8f);
+            if (_examine.InRangeUnOccluded(eye, new MapCoordinates(point, eye.MapId), job.VisionRange,
+                    e => e == uid || e == subject))
+                return true;
+        }
+        return false;
     }
 
     private static string KeyJson(string name, uint tick, double time, EntityUid subject,
