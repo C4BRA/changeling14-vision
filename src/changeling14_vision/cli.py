@@ -212,6 +212,9 @@ def cmd_replays_record(args) -> int:
         return 1
     print(f"recorded {result['pictures']} picture(s) from {result['replay']} in {result['seconds']} s "
           f"-> {out}", flush=True)
+    if result["pictures"]:
+        from .replays.report import write_report
+        print(f"boxes drawn on the pictures: {write_report(out)}", flush=True)
     if result["error"]:
         print(f"the recorder reported an error (see {out / 'error.txt'})", flush=True)
     return 0 if result["finished"] and not result["error"] else 1
