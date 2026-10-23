@@ -33,6 +33,7 @@ from .. import __version__
 from ..model.encoder import EMBED_DIM, Encoder, build_encoder, count_parameters
 from ..progress import Progress, _write_json_atomic
 from .data import CELLS, PAIR_FRACTION, SpriteDataset, load_or_build_index, sprite_views
+from .duplicates import write_report
 from .text import DEFAULT_TEXT_MODEL, TextTable, build_text_table
 from .watch import WATCHSET_SIZE, draw_watchset, pick_watchset
 
@@ -60,6 +61,7 @@ class TrainOptions:
     amp: bool = False                  # half precision on MPS/CUDA (bfloat16 on CPU)
     text_model: str | None = DEFAULT_TEXT_MODEL   # None: no text matching
     rich_text: bool = False            # average name, suffix, folder and component phrases (text.py)
+    dedup: bool = True                 # identical pictures count once (data.py); new models only
     ema: float = 0.999                 # decay of the weight average that is scored and saved
     optimizer: str = "adamw"           # adamw (cosine schedule) or schedulefree (no schedule)
 
@@ -517,7 +519,19 @@ def train(opts: TrainOptions, progress: Progress | None = None) -> dict:
     _seed_everything(opts.seed)
 
     progress.update("index sprites", message="reading the sprite catalogue", force=True)
-    index = load_or_build_index(opts.data, out, seed=opts.seed, progress=progress)
+    fresh_index = not (out / "index.json").is_file()
+    index = load_or_build_index(opts.data, out, seed=opts.seed, progress=progress, dedup=opts.dedup)
+    if index.get("dedup"):
+        copies = sum(1 for it in index["items"] if it.get("copies"))
+        moved = sum(1 for it in index["items"] if it.get("moved"))
+        print(f"train: {copies:,} pictures have an identical copy and count as one; "
+              f"{moved:,} held-out copies of training pictures train instead", flush=True)
+        if fresh_index:
+            try:
+                write_report(index, opts.data, out / "duplicates.html")
+                print(f"train: what was grouped: {out / 'duplicates.html'}", flush=True)
+            except OSError as exc:
+                print(f"train: no duplicates report: {exc}", flush=True)
     print(f"train: {index['counts']} images, {len(index['categories'])} categories, "
           f"{len(index['states']):,} states", flush=True)
 

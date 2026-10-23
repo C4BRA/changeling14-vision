@@ -20,6 +20,14 @@ Splits hold out whole sheets, never single images:
   newview  one image held out of each multi-image training state (another
            direction or animation frame); scored on state
 
+With dedup (the default for new models), identical pictures are grouped by
+their exact pixels. A group is sampled like one picture, each copy keeping
+the item names of all its copies and the folder most of them share; a group
+never straddles the test (a held-out copy of a training picture trains
+instead, and new-view pictures are ones with no copy elsewhere); and each
+animated sprite counts once per direction, its frames taking turns.
+duplicates.py writes the report of what was grouped.
+
 Held and worn overlays (inhand-*, equipped-*) are a third of the catalogue
 but alone are small fragments of a mob. They train at a quarter of the
 weight and are left out of the scores.
@@ -89,9 +97,17 @@ def _holdout(sheet: str, seed: int, fraction: float) -> bool:
     return int.from_bytes(h[:4], "big") / 2**32 < fraction
 
 
-def build_index(dataset: Path, seed: int = 14, unseen_fraction: float = 0.1, progress=None) -> dict:
+def _pixels(img: Image.Image) -> str:
+    """Fingerprint of a picture's exact pixels and size."""
+    rgba = img.convert("RGBA")
+    return hashlib.blake2b(rgba.tobytes() + f"{rgba.size}".encode(), digest_size=12).hexdigest()
+
+
+def build_index(dataset: Path, seed: int = 14, unseen_fraction: float = 0.1, progress=None,
+                dedup: bool = False) -> dict:
     """Read catalogue/images.jsonl, drop empty and out-of-scope images, assign
-    labels and splits. Opens every image once to skip fully transparent ones."""
+    labels and splits. Opens every image once to skip fully transparent ones
+    (and, with dedup, to fingerprint it)."""
     images_file = dataset / "catalogue" / "images.jsonl"
     if not images_file.is_file():
         raise DataError(f"{dataset} has no catalogue/images.jsonl; build the sprite catalogue (M0) first")
@@ -101,6 +117,7 @@ def build_index(dataset: Path, seed: int = 14, unseen_fraction: float = 0.1, pro
     sheet_dirs: dict[str, int] = {}
     kept = []
     opaque: set[str] = set()
+    pixels: dict[str, str] = {}
     for i, r in enumerate(rows):
         if progress and i % 500 == 0:
             progress.update("index sprites", i, len(rows), f"{len(kept):,} usable")
@@ -115,6 +132,8 @@ def build_index(dataset: Path, seed: int = 14, unseen_fraction: float = 0.1, pro
                     continue
                 if r["sheet"].startswith("Tiles/") and (alpha is None or alpha.getextrema()[0] == 255):
                     opaque.add(r["path"])
+                if dedup:
+                    pixels[r["path"]] = _pixels(img)
         except OSError:
             continue
         sheet_dirs[f"{r['sheet']}|{r['state']}"] = max(sheet_dirs.get(f"{r['sheet']}|{r['state']}", 0),
@@ -145,12 +164,8 @@ def build_index(dataset: Path, seed: int = 14, unseen_fraction: float = 0.1, pro
                       "state_id": state_ids.get(key, -1), "split": split,
                       "w": r["width"], "h": r["height"], "worn": is_worn(r["state"]),
                       "opaque": r["path"] in opaque})
-        if split == "train":
-            by_state.setdefault(key, []).append(len(items) - 1)
-    rng = random.Random(seed)
-    for idxs in by_state.values():
-        if len(idxs) >= 2:
-            items[rng.choice(idxs)]["split"] = "newview"
+        if dedup:
+            items[-1]["pixels"] = pixels[r["path"]]
     looks = _read_looks(dataset)
     for look in looks or ():
         if not look.get("composite") or look["sheet"] not in cat_of:
@@ -162,11 +177,71 @@ def build_index(dataset: Path, seed: int = 14, unseen_fraction: float = 0.1, pro
                       "split": "unseen" if look["sheet"] in unseen else "train",
                       "w": look["width"], "h": look["height"], "worn": False, "opaque": False,
                       "look": True, "look_entities": sorted(look["entities"])})
+        if dedup:
+            try:
+                with Image.open(dataset / look["path"]) as img:
+                    items[-1]["pixels"] = _pixels(img)
+            except OSError:
+                items.pop()
+    if dedup:
+        _keep_copies_together(items)
+    for n, it in enumerate(items):
+        if it["split"] == "train" and not it.get("look"):
+            by_state.setdefault(f"{it['sheet']}|{it['state']}", []).append(n)
+    copies = Counter(it["pixels"] for it in items) if dedup else Counter()
+    rng = random.Random(seed)
+    for idxs in by_state.values():
+        if len(idxs) >= 2:
+            # With dedup, a new view must be a picture that appears nowhere else.
+            fresh = [n for n in idxs if copies[items[n].get("pixels")] <= 1] if dedup else idxs
+            if fresh:
+                items[rng.choice(fresh)]["split"] = "newview"
     components = _attach_components(dataset, items, looks)
+    if dedup:
+        _pool_copies(items, categories)
     counts = Counter(it["split"] for it in items)
-    return {"version": INDEX_VERSION, "dataset": str(dataset), "seed": seed,
+    return {"version": INDEX_VERSION, "dataset": str(dataset), "seed": seed, "dedup": dedup,
             "categories": categories, "states": train_states, "components": components,
             "counts": dict(counts), "items": items}
+
+
+def _keep_copies_together(items: list[dict]) -> None:
+    """A picture with a copy in a training sheet trains: a held-out copy of
+    it would only test memory."""
+    trained = {it["pixels"] for it in items if it["split"] == "train"}
+    for it in items:
+        if it["split"] == "unseen" and it["pixels"] in trained:
+            it["split"] = "train"
+            it["moved"] = True
+
+
+def _pool_copies(items: list[dict], categories: list[str]) -> None:
+    """Give identical pictures the same labels and share one picture's weight.
+
+    Names and components: the union over the copies. Folder: the one most
+    copies have (ties: alphabetical). Weight: 1 / (copies x frames of the
+    sprite's direction), so a group counts once and an animation once."""
+    groups: dict[str, list[dict]] = {}
+    for it in items:
+        groups.setdefault(it["pixels"], []).append(it)
+    frames = Counter((it["sheet"], it["state"], it["direction"]) for it in items)
+    for group in groups.values():
+        n = len(group)
+        if n > 1:
+            votes = Counter(categories[it["category"]] for it in group)
+            top = min(votes, key=lambda c: (-votes[c], c))
+            entities = sorted({e for it in group for e in it.get("entities", [])})
+            comps = [it["components"] for it in group if it.get("components") is not None]
+            pooled = sorted(set().union(*comps)) if comps else None
+            for it in group:
+                if categories[it["category"]] != top:
+                    it["own_category"] = it["category"]
+                it["category"] = categories.index(top)
+                it["entities"] = entities
+                it["components"] = pooled
+                it["copies"] = n
+        for it in group:
+            it["weight"] = 1.0 / (n * frames[(it["sheet"], it["state"], it["direction"])])
 
 
 def _read_looks(dataset: Path) -> list[dict] | None:
@@ -226,7 +301,7 @@ def _attach_components(dataset: Path, items: list[dict], looks: list[dict] | Non
     return vocab
 
 
-def load_or_build_index(dataset: Path, out: Path, seed: int = 14, progress=None) -> dict:
+def load_or_build_index(dataset: Path, out: Path, seed: int = 14, progress=None, dedup: bool = False) -> dict:
     """The index lives in the training folder (never inside the M0 output) so a
     resumed run keeps the same label numbering even if M0 is rebuilt."""
     path = out / "index.json"
@@ -237,7 +312,7 @@ def load_or_build_index(dataset: Path, out: Path, seed: int = 14, progress=None)
         if (out / "latest.pt").is_file():
             raise DataError(f"{out} was trained with an older label format, so its checkpoints don't fit "
                             "the new labels. Start a new model (or pass --fresh to start this one over).")
-    index = build_index(dataset, seed=seed, progress=progress)
+    index = build_index(dataset, seed=seed, progress=progress, dedup=dedup)
     out.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name("index.json.tmp")
     tmp.write_text(json.dumps(index))
@@ -367,8 +442,9 @@ class SpriteDataset:
         return self
 
     def weights(self) -> list[float]:
-        """Sampling weights for training: worn overlays less often."""
-        return [WORN_WEIGHT if it["worn"] else 1.0 for it in self.items]
+        """Sampling weights for training: worn overlays less often, and with
+        dedup each copy and frame its share of one picture."""
+        return [(WORN_WEIGHT if it["worn"] else 1.0) * it.get("weight", 1.0) for it in self.items]
 
     def __len__(self) -> int:
         return len(self.items)

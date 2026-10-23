@@ -403,3 +403,35 @@ def test_continued_model_keeps_its_training_settings(tmp_path, monkeypatch):
     assert main(["train", "--out", str(tmp_path / "new"), "--data", str(data), "--size", "nano"]) == 0
     o = seen["opts"]
     assert (o.batch, o.optimizer, o.lr, o.rich_text, o.amp) == (128, "adamw", 1e-3, False, False)
+
+
+def test_dedup_counts_identical_pictures_once(tmp_path):
+    from changeling14_vision.pretrain.data import SpriteDataset
+    from changeling14_vision.pretrain.duplicates import write_report
+    data = _fake_dataset(tmp_path / "ds")
+    plain = build_index(data, unseen_fraction=0.3, seed=3)
+    # Copy a training door's picture into an unseen tool sheet, so a group spans both.
+    unseen = next(it for it in plain["items"] if it["split"] == "unseen" and "Tools" in it["sheet"])
+    trained = next(it for it in plain["items"] if it["split"] == "train" and "Doors" in it["sheet"])
+    (data / unseen["path"]).write_bytes((data / trained["path"]).read_bytes())
+    index = build_index(data, unseen_fraction=0.3, seed=3, dedup=True)
+    assert index["dedup"] and not plain.get("dedup")
+    groups = {}
+    for it in index["items"]:
+        groups.setdefault(it["pixels"], []).append(it)
+    for g in groups.values():
+        # One label set and one picture's weight per group, per animation.
+        assert len({it["category"] for it in g}) == 1 and len({tuple(it["entities"]) for it in g}) == 1
+        assert abs(sum(it["weight"] for it in g) - 1) < 1e-9
+        assert all(it["split"] != "newview" for it in g) or len(g) == 1
+        assert len({it["split"] == "unseen" for it in g}) == 1      # never on both sides of the test
+    moved = next(it for it in index["items"] if it["path"] == unseen["path"])
+    assert moved["split"] == "train" and moved.get("moved")
+    # The door's copy in the tool sheet: the folder most copies share, and both names.
+    assert index["categories"][moved["category"]] == "Structures/Doors"
+    assert set(moved["entities"]) == set(trained["entities"]) | set(unseen["entities"])
+    ds = SpriteDataset(data, index, "train", train=True)
+    assert len(ds.weights()) == len(ds) and min(ds.weights()) > 0
+    write_report(index, data, tmp_path / "duplicates.html")
+    page = (tmp_path / "duplicates.html").read_text()
+    assert "Biggest groups" in page and "moved into training" in page and "data:image/png" in page

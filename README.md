@@ -101,7 +101,12 @@ direction or frame of the same sprite has to land nearest), and the facing
 direction. Half of the training pictures are 2×2 canvases of four small
 sprites, each 32-pixel tile learning its own category and name, so the tile
 outputs learn to tell neighbours apart. Screen HUD art (`Interface/`, `Actions/`,
-`Markers/`, …) is left out. Held and worn overlays (`inhand-*`,
+`Markers/`, …) is left out. Identical pictures (a fifth of the catalogue: a door's closing frames are
+its opening frames reversed, crates share a sparking state) count once by
+default: each group keeps every item name of its copies, never sits on both
+sides of the test, and each animation counts once per direction. A new model
+folder gets `duplicates.html` showing what was grouped; `--no-dedup` turns it
+off. Held and worn overlays (`inhand-*`,
 `equipped-*`) are a third of the catalogue but alone are small fragments of
 a mob, so they train at a quarter of the weight and are left out of the
 scores.
