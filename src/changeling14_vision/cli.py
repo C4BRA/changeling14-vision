@@ -241,7 +241,7 @@ def cmd_replays_dataset(args) -> int:
     holdout = args.holdout.split(",") if args.holdout is not None else None
     s = build_dataset(recordings, Path(args.out), rows, holdout, progress)
     print(f"dataset: {s['frames']} frames ({s['train_frames']} train, {s['test_frames']} test, "
-          f"test rounds {', '.join(s['test_rounds']) or 'none'}), {s['repeats_dropped']} near-repeats dropped, "
+          f"test rounds {', '.join(s['test_rounds']) or 'none'}), {s['repeats_dropped']} near-repeats and {s['black_dropped']} black pictures dropped, "
           f"{s['visible_sprites']} of {s['sprites']} sprites visible -> {Path(args.out).expanduser()}", flush=True)
     return 0
 

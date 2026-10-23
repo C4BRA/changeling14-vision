@@ -17,7 +17,8 @@ stands, which differs for wall-mounted things) and three flags:
 
 Nothing is dropped for being blocked or dark, so the model also learns what
 it can't see. Pictures that are nearly the same as the last kept picture from
-the same player are dropped. Whole rounds are held out for testing, never
+the same player are dropped, and so are pictures that are almost entirely
+black (a player in a locker or a dark room with no light). Whole rounds are held out for testing, never
 single frames, because frames from one round look alike.
 """
 
@@ -34,6 +35,7 @@ from PIL import Image
 TILE = 32
 DARK = 12 / 255           # mean brightness below this counts as dark
 REPEAT = 4 / 255          # mean difference below this counts as a repeat
+BLACK = 0.95              # pictures with more near-black pixels than this show nothing to learn
 
 
 def _round_of(recording: Path, library_rows: dict[str, dict]) -> str:
@@ -75,7 +77,7 @@ def build_dataset(recordings: list[Path], out: Path, library_rows: dict[str, dic
 
     frames_out = out / "frames"
     shutil.rmtree(frames_out, ignore_errors=True)
-    frames, repeats = [], 0
+    frames, repeats, blacks = [], 0, 0
     keys = [(rec, k) for rec in recordings for k in sorted((rec / "frames").glob("*.json"))]
     last: dict[tuple[str, int], np.ndarray] = {}
     for n, (rec, key_path) in enumerate(keys):
@@ -88,6 +90,9 @@ def build_dataset(recordings: list[Path], out: Path, library_rows: dict[str, dic
         s = _scale(key)
         if s > 1:
             img = img.reduce(s)
+        if float((np.asarray(img.convert("L")) < 10).mean()) > BLACK:
+            blacks += 1
+            continue
         thumb = _thumb(img)
         who = (rec.name, key["subject"])
         if who in last and float(np.abs(thumb - last[who]).mean()) < REPEAT:
@@ -126,7 +131,7 @@ def build_dataset(recordings: list[Path], out: Path, library_rows: dict[str, dic
                        "eye_rotation": key["eye_rotation"], "sprites": sprites})
 
     summary = {
-        "frames": len(frames), "repeats_dropped": repeats,
+        "frames": len(frames), "repeats_dropped": repeats, "black_dropped": blacks,
         "rounds": rounds, "test_rounds": sorted(test_rounds),
         "train_frames": sum(f["split"] == "train" for f in frames),
         "test_frames": sum(f["split"] == "test" for f in frames),
@@ -173,7 +178,7 @@ figure{{margin:0 0 24px}} .pic{{position:relative;max-width:100%;width:960px}}
 </style>
 <h1>Replay dataset</h1>
 <p>{s["frames"]} frames ({s["train_frames"]} train, {s["test_frames"]} test from rounds
-{html.escape(", ".join(s["test_rounds"]) or "none")}), {s["repeats_dropped"]} near-repeats dropped,
+{html.escape(", ".join(s["test_rounds"]) or "none")}), {s["repeats_dropped"]} near-repeats and {s.get("black_dropped", 0)} black pictures dropped,
 {s["visible_sprites"]} of {s["sprites"]} sprites visible.</p>
 <p>Green: visible. Blue dashed: dark. Grey dashed: behind a wall. Yellow: the followed player.</p>
 {"".join(figs)}"""
