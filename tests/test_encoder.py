@@ -370,3 +370,36 @@ def test_rich_text_uses_only_catalogue_facts(tmp_path):
     assert table.texts == ["bucket. It's a boring old bucket."] and table.rich
     assert table.rows_for(["Bucket", "Bucket2"]) == [0] and len(seen) == len(set(seen)) == 4
     assert abs(np.linalg.norm(table.vectors[0]) - 1) < 1e-2
+
+
+def test_continued_model_keeps_its_training_settings(tmp_path, monkeypatch):
+    """Continuing with only --out (or the app's --steps) keeps the folder's batch,
+    optimiser, learning rate and text settings; anything given explicitly wins,
+    and a new folder gets the defaults."""
+    import changeling14_vision.pretrain.train as train_mod
+    seen = {}
+
+    def fake_train(opts, progress=None):
+        seen["opts"] = opts
+        return {"complete": True}
+
+    monkeypatch.setattr(train_mod, "train", fake_train)
+    data = _fake_dataset(tmp_path / "ds")
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "latest.pt").write_bytes(b"")
+    (model / "config.json").write_text(json.dumps({
+        "data": str(data.resolve()), "size": "nano", "batch": 512, "optimizer": "schedulefree", "lr": 0.004,
+        "checkpoint_every": 250, "rich_text": True, "amp": True}))
+
+    assert main(["train", "--out", str(model), "--steps", "100"]) == 0
+    o = seen["opts"]
+    assert (o.batch, o.optimizer, o.lr, o.checkpoint_every, o.rich_text, o.amp, o.size) == (
+        512, "schedulefree", 0.004, 250, True, True, "nano")
+
+    assert main(["train", "--out", str(model), "--batch", "256", "--no-amp"]) == 0
+    assert (seen["opts"].batch, seen["opts"].amp, seen["opts"].optimizer) == (256, False, "schedulefree")
+
+    assert main(["train", "--out", str(tmp_path / "new"), "--data", str(data), "--size", "nano"]) == 0
+    o = seen["opts"]
+    assert (o.batch, o.optimizer, o.lr, o.rich_text, o.amp) == (128, "adamw", 1e-3, False, False)

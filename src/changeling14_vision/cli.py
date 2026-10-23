@@ -63,6 +63,19 @@ def _resolve_model_args(args, resuming: bool = True) -> str | None:
     return None
 
 
+# Training settings a model folder keeps: when continuing, any not given on
+# the command line come from its config.json; for a new folder, these defaults.
+KEPT = {"batch": 128, "optimizer": "adamw", "lr": None, "checkpoint_every": None,
+        "rich_text": False, "amp": False}
+
+
+def _resolve_train_settings(args, resuming: bool) -> None:
+    cfg = _folder_config(_model_dir(args)) if resuming and (_model_dir(args) / "latest.pt").exists() else {}
+    for name, default in KEPT.items():
+        if getattr(args, name) is None:
+            setattr(args, name, cfg.get(name, default))
+
+
 def cmd_sprites(args) -> int:
     from .sprites.build import BuildError, Options, build
 
@@ -90,6 +103,7 @@ def cmd_train(args) -> int:
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return 2
+    _resolve_train_settings(args, resuming=not args.fresh)
     opts = TrainOptions(data=Path(args.data).expanduser().resolve(), out=_model_dir(args), size=args.size,
                         steps=args.steps, batch=args.batch, lr=args.lr, workers=args.workers,
                         checkpoint_every=args.checkpoint_every, checkpoint_minutes=args.checkpoint_minutes,
@@ -162,15 +176,18 @@ def main(argv: list[str] | None = None) -> int:
                                   f"else {DEFAULT_OUT}); a model folder keeps its catalogue for life")
     model_args(p)
     p.add_argument("--steps", type=int, default=20000, help="total optimizer steps (default 20000)")
-    p.add_argument("--batch", type=int, default=128,
-                   help="pictures per step (default 128); 256 or 512 run faster per picture on a GPU. The learning "
+    p.add_argument("--batch", type=int,
+                   help="pictures per step (default: the model folder's, else 128); 256 or 512 run faster per picture on a GPU. The learning "
                         "rate, warm-up and checkpoint spacing follow it; lower --steps to train on the same pictures")
-    p.add_argument("--lr", type=float, help="learning rate (default 1e-3 x sqrt(batch/128); 2e-3 schedule-free)")
-    p.add_argument("--optimizer", default="adamw", choices=["adamw", "schedulefree"],
-                   help="adamw with a cosine schedule (default), or schedule-free AdamW (no schedule: stop any time)")
+    p.add_argument("--lr", type=float, help="learning rate (default: the model folder's, else 1e-3 x "
+                                            "sqrt(batch/128); 2e-3 schedule-free)")
+    p.add_argument("--optimizer", choices=["adamw", "schedulefree"],
+                   help="adamw with a cosine schedule (default), or schedule-free AdamW (no schedule: stop any "
+                        "time); a model folder keeps its own")
     p.add_argument("--workers", type=int, default=2, help="data loading processes (default 2)")
     p.add_argument("--checkpoint-every", type=int,
-                   help="steps between checkpoints (default: every 128,000 pictures, 1,000 steps at batch 128)")
+                   help="steps between checkpoints (default: the model folder's, else every 128,000 pictures, "
+                        "1,000 steps at batch 128)")
     p.add_argument("--checkpoint-minutes", type=float, default=15.0,
                    help="also checkpoint at least this often (default 15)")
     p.add_argument("--minutes", type=float, help="stop cleanly after this many minutes; run again to resume")
@@ -178,10 +195,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--text-model", default="sentence-transformers/all-MiniLM-L6-v2",
                    help="sentence model for matching sprites to entity names (downloaded once)")
     p.add_argument("--no-text", action="store_true", help="train without text matching")
-    p.add_argument("--rich-text", action="store_true",
+    p.add_argument("--rich-text", action="store_true", default=None,
                    help="also describe each item by its suffix, folders and components (new models only)")
-    p.add_argument("--amp", action="store_true",
-                   help="half precision on the GPU: often faster on Apple chips; check the loss still falls")
+    p.add_argument("--amp", action="store_true", default=None,
+                   help="half precision on the GPU: often faster on Apple chips; check the loss still falls "
+                        "(default: the model folder's)")
+    p.add_argument("--no-amp", dest="amp", action="store_false", help="full precision, even if the folder used --amp")
     p.add_argument("--seed", type=int, default=14)
     p.set_defaults(func=cmd_train)
 
