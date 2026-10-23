@@ -29,6 +29,7 @@ using Robust.Client.Replays.Playback;
 using Robust.Client.State;
 using Robust.Shared.ContentPack;
 using Robust.Shared.Containers;
+using Robust.Shared.Graphics;
 using Robust.Shared.Map;
 using Robust.Shared.Replays;
 using Robust.Shared.Utility;
