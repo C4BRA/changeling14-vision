@@ -246,6 +246,26 @@ def cmd_replays_dataset(args) -> int:
     return 0
 
 
+def cmd_replays_train(args) -> int:
+    try:
+        from .replays.detect import DetectOptions, train_detect
+    except ImportError as exc:
+        print(f"{TRAIN_DEPS} ({exc})", flush=True)
+        return 1
+    models = Path(args.models).expanduser()
+    start = Path(args.start).expanduser()
+    if not start.is_absolute() and not start.exists():
+        start = models / args.start
+    opts = DetectOptions(dataset=Path(args.dataset).expanduser(), start=start, out=models / args.name,
+                         steps=args.steps, batch=args.batch, workers=args.workers, device=args.device,
+                         minutes=args.minutes)
+    progress = Progress(args.run_dir)
+    progress.catch_stop()
+    row = train_detect(opts, progress)
+    print(f"detect: done at step {row.get('step', 0):,} -> {opts.out}", flush=True)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="changeling14-vision")
     parser.add_argument("--run-dir", help="report progress here (default: $C14_RUN_DIR)")
@@ -352,6 +372,18 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--out", default=DEFAULT_REPLAY_DATASET, help=f"output folder (default {DEFAULT_REPLAY_DATASET})")
     r.add_argument("--holdout", help="comma-separated round ids kept for testing (default: about 1 in 5 rounds)")
     r.set_defaults(func=cmd_replays_dataset)
+    r = rsub.add_parser("train", help="train a sprite model to find and name things in replay frames")
+    r.add_argument("name", help="new model folder name (inside --models); resumes if it exists")
+    r.add_argument("--from", dest="start", required=True,
+                   help="the sprite model folder to start from (a name inside --models, or a path)")
+    r.add_argument("--dataset", default=DEFAULT_REPLAY_DATASET, help=f"replay dataset (default {DEFAULT_REPLAY_DATASET})")
+    r.add_argument("--models", default=DEFAULT_MODELS, help=f"models folder (default {DEFAULT_MODELS})")
+    r.add_argument("--steps", type=int, default=6000, help="training steps (default 6000)")
+    r.add_argument("--batch", type=int, default=8, help="480x480 crops per step (default 8)")
+    r.add_argument("--minutes", type=float, help="stop cleanly after this long")
+    r.add_argument("--workers", type=int, default=2, help="picture loading processes (default 2)")
+    r.add_argument("--device", default="auto", help="auto, mps, cuda or cpu (default auto)")
+    r.set_defaults(func=cmd_replays_train)
 
     args = parser.parse_args(argv)
     return args.func(args)

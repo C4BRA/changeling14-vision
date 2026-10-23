@@ -265,3 +265,47 @@ def test_replay_dataset_shrinks_marks_dark_and_holds_out_rounds(tmp_path):
     assert lit["box"] == [0.0, 0.0, 32.0, 32.0] and lit["visible"]
     assert dark["dark"] and not dark["visible"]
     assert (tmp_path / "out" / "report.html").is_file()
+
+
+def test_detect_trains_from_a_stage1_model(tmp_path):
+    import numpy as np
+    import torch
+    from PIL import Image
+
+    from changeling14_vision.pretrain.train import build_model
+    from changeling14_vision.replays.detect import DetectOptions, train_detect
+
+    start = tmp_path / "stage1"
+    start.mkdir()
+    texts = ["wall. a wall", "light. a lamp", "airlock"]
+    vec = np.random.default_rng(0).normal(size=(3, 8)).astype(np.float32)
+    np.savez(start / "text.npz", texts=np.array(texts), vectors=vec.astype(np.float16),
+             entities=np.array(["WallSolid", "Poweredlight", "Airlock"]),
+             entity_text=np.array([0, 1, 2], dtype=np.int32), model=np.array("test"), rich=np.array(False))
+    m = build_model("nano", {"categories": ["a", "b"]}, text_dim=8)
+    torch.save({"model": m.state_dict(), "encoder_config": m.encoder.config, "text_dim": 8, "step": 5},
+               start / "latest.pt")
+
+    ds = tmp_path / "ds"
+    (ds / "frames").mkdir(parents=True)
+    frames = []
+    for i, split in enumerate(("train", "train", "test")):
+        Image.fromarray(np.full((96, 128, 3), 40 * i + 50, np.uint8)).save(ds / "frames" / f"{i}.png")
+        sprites = [{"prototype": "WallSolid", "name": "wall", "box": [0, 0, 32, 32], "draw_depth": 0,
+                    "blocked": False, "dark": False, "visible": True, "humanoid": False, "alive": False,
+                    "subject": False},
+                   {"prototype": "Poweredlight", "name": "light", "box": [40, 40, 72, 72], "draw_depth": 2,
+                    "blocked": True, "dark": False, "visible": False, "humanoid": False, "alive": False,
+                    "subject": False}]
+        frames.append({"picture": f"frames/{i}.png", "split": split, "round": str(i), "width": 128,
+                       "height": 96, "sprites": sprites})
+    (ds / "dataset.json").write_text(json.dumps({"version": 1, "frames": frames}))
+
+    opts = DetectOptions(dataset=ds, start=start, out=tmp_path / "det", steps=3, batch=2, workers=0,
+                         device="cpu", checkpoint_every=2, warmup=1)
+    row = train_detect(opts)
+    assert row["step"] == 3 and "name_top1" in row and row["named_sprites"] == 1
+    assert (tmp_path / "det" / "checkpoints" / "step-2.pt").is_file()
+    # Resuming continues from the saved step.
+    opts.steps = 4
+    assert train_detect(opts)["step"] == 4
