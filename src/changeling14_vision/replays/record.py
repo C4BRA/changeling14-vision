@@ -84,9 +84,10 @@ def prepare_client(commit: str, build: str, source: Path, clients: Path, log=pri
                        capture_output=True, text=True)
         _run(["git", "-C", str(source), "worktree", "add", "--detach", str(dest), commit], log=log)
     try:
-        _run(["git", "-C", str(dest), "submodule", "update", "--init", "--depth", "1", "RobustToolbox"], log=log)
+        _run(["git", "-C", str(dest), "submodule", "update", "--init", "--recursive", "--depth", "1",
+              "RobustToolbox"], log=log)
     except RecordError:
-        _run(["git", "-C", str(dest), "submodule", "update", "--init", "RobustToolbox"], log=log)
+        _run(["git", "-C", str(dest), "submodule", "update", "--init", "--recursive", "RobustToolbox"], log=log)
 
     addon = dest / ADDON_DIR
     addon.mkdir(parents=True, exist_ok=True)
