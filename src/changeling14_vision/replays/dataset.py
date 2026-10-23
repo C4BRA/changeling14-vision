@@ -45,12 +45,19 @@ def _round_of(recording: Path, library_rows: dict[str, dict]) -> str:
     return recording.name
 
 
-def _scale(key: dict) -> int:
-    """How many picture pixels the client drew per game pixel."""
-    sizes = sorted(round(e["box"][2] - e["box"][0]) for e in key["entities"]
-                   if e["prototype"].startswith(("Wall", "Floor", "Grille")) or e["draw_depth"] <= -10)
-    tile = sizes[len(sizes) // 2] if sizes else TILE
-    return max(1, round(tile / TILE))
+VIEW = (672, 480)         # the game view at 32 px per tile, eye zoom 1
+
+
+def _scale(key: dict) -> int | None:
+    """How many picture pixels the client drew per game pixel, or None for a
+    picture that isn't the normal view at zoom 1 (those are left out, so every
+    frame is the same size with the same 32 px tiles)."""
+    if abs(float(key.get("zoom", 1)) - 1) > 0.01:
+        return None
+    w, h = key["width"], key["height"]
+    if w % VIEW[0] or w // VIEW[0] * VIEW[1] != h:
+        return None
+    return w // VIEW[0]
 
 
 def _thumb(img: Image.Image) -> np.ndarray:
@@ -77,7 +84,7 @@ def build_dataset(recordings: list[Path], out: Path, library_rows: dict[str, dic
 
     frames_out = out / "frames"
     shutil.rmtree(frames_out, ignore_errors=True)
-    frames, repeats, blacks = [], 0, 0
+    frames, repeats, blacks, other_view = [], 0, 0, 0
     keys = [(rec, k) for rec in recordings for k in sorted((rec / "frames").glob("*.json"))]
     last: dict[tuple[str, int], np.ndarray] = {}
     for n, (rec, key_path) in enumerate(keys):
@@ -88,6 +95,9 @@ def build_dataset(recordings: list[Path], out: Path, library_rows: dict[str, dic
         key = json.loads(key_path.read_text(encoding="utf-8"))
         img = Image.open(key_path.with_name(key["picture"])).convert("RGB")
         s = _scale(key)
+        if s is None:
+            other_view += 1
+            continue
         if s > 1:
             img = img.reduce(s)
         if float((np.asarray(img.convert("L")) < 10).mean()) > BLACK:
@@ -131,7 +141,7 @@ def build_dataset(recordings: list[Path], out: Path, library_rows: dict[str, dic
                        "eye_rotation": key["eye_rotation"], "sprites": sprites})
 
     summary = {
-        "frames": len(frames), "repeats_dropped": repeats, "black_dropped": blacks,
+        "frames": len(frames), "repeats_dropped": repeats, "black_dropped": blacks, "other_view_dropped": other_view,
         "rounds": rounds, "test_rounds": sorted(test_rounds),
         "train_frames": sum(f["split"] == "train" for f in frames),
         "test_frames": sum(f["split"] == "test" for f in frames),

@@ -246,21 +246,21 @@ def test_replay_dataset_shrinks_marks_dark_and_holds_out_rounds(tmp_path):
         frames = tmp_path / rec / "frames"
         frames.mkdir(parents=True)
         for i, shade in enumerate((200, 200, 240)):        # the second picture repeats the first
-            a = np.zeros((144, 192, 3), np.uint8)
-            a[:, :96] = shade
+            a = np.zeros((960, 1344, 3), np.uint8)
+            a[:, :672] = shade
             Image.fromarray(a).save(frames / f"{i:05d}-5.png")
-            ents = [{"uid": k, "prototype": "WallSolid", "name": "wall", "center": [48 + 96 * k, 48],
-                     "box": [96 * k, 0, 96 * k + 96, 96], "draw_depth": -10, "rotation": 0, "blocked": False,
+            ents = [{"uid": k, "prototype": "WallSolid", "name": "wall", "center": [32 + 700 * k, 32],
+                     "box": [700 * k, 0, 700 * k + 64, 64], "draw_depth": -10, "rotation": 0, "blocked": False,
                      "alive": False, "humanoid": False, "subject": False} for k in range(2)]
             (frames / f"{i:05d}-5.json").write_text(json.dumps(
                 {"picture": f"{i:05d}-5.png", "tick": i, "time": i * 30.0, "subject": 5, "eye_rotation": 0,
-                 "zoom": 1, "width": 192, "height": 144, "entities": ents}))
+                 "zoom": 1, "width": 1344, "height": 960, "entities": ents}))
         recs.append(tmp_path / rec)
     s = build_dataset(recs, tmp_path / "out", holdout=["roundB"])
     assert (s["frames"], s["repeats_dropped"], s["test_frames"]) == (4, 2, 2)
     data = json.loads((tmp_path / "out" / "dataset.json").read_text())
     f = data["frames"][0]
-    assert (f["width"], f["height"]) == (64, 48)
+    assert (f["width"], f["height"]) == (672, 480)
     lit, dark = f["sprites"]
     assert lit["box"] == [0.0, 0.0, 32.0, 32.0] and lit["visible"]
     assert dark["dark"] and not dark["visible"]
@@ -290,15 +290,16 @@ def test_detect_trains_from_a_stage1_model(tmp_path):
     (ds / "frames").mkdir(parents=True)
     frames = []
     for i, split in enumerate(("train", "train", "test")):
-        Image.fromarray(np.full((96, 128, 3), 40 * i + 50, np.uint8)).save(ds / "frames" / f"{i}.png")
+        size = (480, 480) if split == "train" else (96, 128)       # held-out frames may differ in size
+        Image.fromarray(np.full((*size, 3), 40 * i + 50, np.uint8)).save(ds / "frames" / f"{i}.png")
         sprites = [{"prototype": "WallSolid", "name": "wall", "box": [0, 0, 32, 32], "draw_depth": 0,
                     "blocked": False, "dark": False, "visible": True, "humanoid": False, "alive": False,
                     "subject": False},
                    {"prototype": "Poweredlight", "name": "light", "box": [40, 40, 72, 72], "draw_depth": 2,
                     "blocked": True, "dark": False, "visible": False, "humanoid": False, "alive": False,
                     "subject": False}]
-        frames.append({"picture": f"frames/{i}.png", "split": split, "round": str(i), "width": 128,
-                       "height": 96, "sprites": sprites})
+        frames.append({"picture": f"frames/{i}.png", "split": split, "round": str(i), "width": size[1],
+                       "height": size[0], "sprites": sprites})
     (ds / "dataset.json").write_text(json.dumps({"version": 1, "frames": frames}))
 
     opts = DetectOptions(dataset=ds, start=start, out=tmp_path / "det", steps=3, batch=2, workers=0,

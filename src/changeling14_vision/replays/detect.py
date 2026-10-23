@@ -76,6 +76,9 @@ class Frames(torch.utils.data.Dataset):
         data = json.loads((dataset / "dataset.json").read_text(encoding="utf-8"))
         self.root = dataset
         self.frames = [f for f in data["frames"] if f["split"] == split]
+        if crop:
+            # Training crops are all crop x crop, so smaller frames can't be used.
+            self.frames = [f for f in self.frames if f["width"] >= crop and f["height"] >= crop]
         self.text = text
         self.crop = crop
         self.seed = seed
@@ -300,7 +303,8 @@ def train_detect(opts: DetectOptions, progress: Progress | None = None) -> dict:
     loader = torch.utils.data.DataLoader(train_ds, batch_size=opts.batch, shuffle=True, drop_last=True,
                                          num_workers=opts.workers, collate_fn=collate,
                                          persistent_workers=opts.workers > 0)
-    test_loader = torch.utils.data.DataLoader(test_ds, batch_size=4, collate_fn=collate, num_workers=0)
+    # One whole frame at a time: held-out frames needn't all be the same size.
+    test_loader = torch.utils.data.DataLoader(test_ds, batch_size=1, collate_fn=collate, num_workers=0)
 
     enc = list(model.encoder.parameters())
     heads = [p for n, p in model.named_parameters() if not n.startswith("encoder.")]
