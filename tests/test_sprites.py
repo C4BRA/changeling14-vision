@@ -268,15 +268,22 @@ def test_replay_dataset_shrinks_marks_dark_and_holds_out_rounds(tmp_path):
     assert (tmp_path / "out" / "report.html").is_file()
 
 
-def test_contrast_marks_floor_coloured_sprites():
+def test_faint_floor_sprites():
     import numpy as np
 
-    from changeling14_vision.replays.dataset import FAINT, _contrast
+    from changeling14_vision.replays.dataset import _looks_faint
 
     floor = np.full((96, 96, 3), 0.4, np.float32)
-    assert _contrast(floor, 32, 32, 64, 64) < FAINT
-    floor[40:56, 40:56] = 0.9            # a pale splat in the middle tile
-    assert _contrast(floor, 32, 32, 64, 64) > FAINT
+    assert _looks_faint(floor, 32, 32, 64, 64)                     # nothing there
+    pipe = floor.copy()
+    pipe[47:49, 32:64] = 0.9                                       # a thin pipe: low average, sharp line
+    assert not _looks_faint(pipe, 32, 32, 64, 64)
+    splat = floor.copy()
+    splat[40:56, 40:56] = 0.9
+    assert not _looks_faint(splat, 32, 32, 64, 64)
+    # Carpet in a carpeted room: the ring is all carpet, so it can't be judged faint.
+    carpets = [(x, y, x + 32, y + 32) for x in (0, 32, 64) for y in (0, 32, 64)]
+    assert not _looks_faint(floor, 32, 32, 64, 64, carpets)
 
 
 def test_detect_trains_from_a_stage1_model(tmp_path):

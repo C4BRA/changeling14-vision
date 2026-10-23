@@ -37,7 +37,8 @@ from PIL import Image
 TILE = 32
 DARK = 12 / 255           # mean brightness below this counts as dark
 REPEAT = 4 / 255          # mean difference below this counts as a repeat
-FAINT = 12 / 255          # floor-level sprites differing less than this from around them can't be seen
+FAINT = 12 / 255          # floor-level sprites differing less than this from around them can't be seen,
+FAINT_PEAK = 22 / 255     # unless their most different pixels (95th percentile) differ more than this
 FLOOR_LEVEL = -5          # draw depths up to HighFloorObjects (puddles, pipes, cables, decals)
 BLACK = 0.95              # pictures with more near-black pixels than this show nothing to learn
 
@@ -64,16 +65,26 @@ def _scale(key: dict) -> int | None:
     return w // VIEW[0]
 
 
-def _contrast(pixels: np.ndarray, x0: int, y0: int, x1: int, y1: int) -> float:
-    """Mean difference between a box and the median colour of the tile-wide ring around it."""
+def _looks_faint(pixels: np.ndarray, x0: int, y0: int, x1: int, y1: int,
+                 same: list[tuple[int, int, int, int]] = ()) -> bool:
+    """Whether a box looks just like the floor around it: on average it differs
+    by less than FAINT from the median colour of the tile-wide ring, and no
+    real line or outline stands out either (a thin pipe or cable has a low
+    average but a few strongly different pixels). Parts of the ring covered by
+    the same kind of sprite (a carpet next to carpet) are left out; with too
+    little ring left there is nothing to compare against, so it isn't faint."""
     h, w = pixels.shape[:2]
     rx0, ry0, rx1, ry1 = max(0, x0 - TILE), max(0, y0 - TILE), min(w, x1 + TILE), min(h, y1 + TILE)
     ring = np.ones((ry1 - ry0, rx1 - rx0), bool)
+    for sx0, sy0, sx1, sy1 in same:
+        ring[max(0, sy0 - ry0):max(0, sy1 - ry0), max(0, sx0 - rx0):max(0, sx1 - rx0)] = False
     ring[y0 - ry0:y1 - ry0, x0 - rx0:x1 - rx0] = False
-    if not ring.any():
-        return 1.0
+    full = (ry1 - ry0) * (rx1 - rx0) - (y1 - y0) * (x1 - x0)
+    if ring.sum() < 0.25 * max(1, full):
+        return False
     around = np.median(pixels[ry0:ry1, rx0:rx1][ring], axis=0)
-    return float(np.abs(pixels[y0:y1, x0:x1] - around).mean())
+    diff = np.abs(pixels[y0:y1, x0:x1] - around).mean(axis=2)
+    return float(diff.mean()) < FAINT and float(np.percentile(diff, 95)) < FAINT_PEAK
 
 
 def _thumb(img: Image.Image) -> np.ndarray:
@@ -129,6 +140,11 @@ def build_dataset(recordings: list[Path], out: Path, library_rows: dict[str, dic
         pixels = np.asarray(img, dtype=np.float32) / 255
         h, w = pixels.shape[:2]
         sprites = []
+        boxes: dict[str, list[tuple[int, int, int, int]]] = {}
+        for e in key["entities"]:
+            bx = [v / s for v in e["box"]]
+            boxes.setdefault(e["prototype"], []).append(
+                (int(bx[0]), int(bx[1]), int(np.ceil(bx[2])), int(np.ceil(bx[3]))))
         for e in key["entities"]:
             x0, y0, x1, y1 = (v / s for v in e["box"])
             cx0, cy0 = max(0, int(x0)), max(0, int(y0))
@@ -139,7 +155,7 @@ def build_dataset(recordings: list[Path], out: Path, library_rows: dict[str, dic
             # Floor-level things (puddles, cables, pipes, decals) can be drawn but
             # not seen: under a floor tile, dried to a speck, or floor-coloured.
             faint = bool(e.get("under_floor")) or (
-                e["draw_depth"] <= FLOOR_LEVEL and _contrast(pixels, cx0, cy0, cx1, cy1) < FAINT)
+                e["draw_depth"] <= FLOOR_LEVEL and _looks_faint(pixels, cx0, cy0, cx1, cy1, boxes[e["prototype"]]))
             sprites.append({
                 "prototype": e["prototype"], "name": e["name"],
                 "box": [round(x0, 1), round(y0, 1), round(x1, 1), round(y1, 1)],
