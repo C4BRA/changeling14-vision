@@ -31,6 +31,7 @@ class Guess:
     name: str
     score: float                                # how sure that something is there, 0..1
     names: list[tuple[str, float]]              # top names with their match scores
+    player: float = 0.0                         # how sure that a player stands here, 0..1
 
 
 def load_detect_model(folder: Path, device: str = "auto") -> tuple[DetectModel, TextTable, torch.device]:
@@ -40,7 +41,7 @@ def load_detect_model(folder: Path, device: str = "auto") -> tuple[DetectModel, 
         raise SystemExit(f"{folder} is not a replay-trained model (train one with 'replays train')")
     table = TextTable(folder / "text.npz")
     model = DetectModel(Encoder(**{k: v for k, v in ckpt["encoder_config"].items() if k != "tile"}), table.dim)
-    model.load_state_dict(ckpt["model"])
+    model.load_state_dict(ckpt["model"], strict=False)
     dev = pick_device(device)
     model.to(dev).eval()
     model.set_text(table)
@@ -60,6 +61,7 @@ def guesses(model: DetectModel, names: list[str], image: torch.Tensor, threshold
     b = image.shape[0]
     all_t = model.texts() if all_t is None else all_t
     p = torch.sigmoid(out["something"]).view(b, gh * gw)
+    pl = torch.sigmoid(out["player"]).view(b, gh * gw).cpu()
     sims = out["names"] @ all_t.T * model.scale.exp() + model.bias
     best = torch.sigmoid(sims).topk(top, dim=1)
     vals, rows = best.values.view(b, gh * gw, top).cpu(), best.indices.view(b, gh * gw, top).cpu()
@@ -75,7 +77,7 @@ def guesses(model: DetectModel, names: list[str], image: torch.Tensor, threshold
             w, h = float(np.exp(lw)) * CELL, float(np.exp(lh)) * CELL
             top_names = [(names[r], float(v)) for r, v in zip(rows[i, cell].tolist(), vals[i, cell].tolist())]
             found.append(Guess((x - w / 2, y - h / 2, x + w / 2, y + h / 2), top_names[0][0],
-                               float(p[i, cell]), top_names))
+                               float(p[i, cell]), top_names, float(pl[i, cell])))
         result.append(found)
     return result
 
@@ -244,9 +246,13 @@ def live(folder: Path, region: tuple[int, int, int, int] | None, tile_px: float 
             view = cv2.resize(frame, (w32 * show, h32 * show), interpolation=cv2.INTER_NEAREST)
             for g in found:
                 x0, y0, x1, y1 = (int(v * show) for v in g.box)
-                cv2.rectangle(view, (x0, y0), (x1, y1), (0, 200, 255), 1)
+                is_player = g.player >= 0.5
+                cv2.rectangle(view, (x0, y0), (x1, y1), (255, 0, 255) if is_player else (0, 200, 255),
+                              2 if is_player else 1)
                 if labels:
                     label = g.name[:18] if g.names[0][1] >= name_threshold else "?"
+                    if is_player:
+                        label = f"player: {label}"
                     cv2.putText(view, label, (x0, max(10, y0 - 2)), cv2.FONT_HERSHEY_SIMPLEX, 0.35,
                                 (255, 255, 255), 1, cv2.LINE_AA)
             cv2.putText(view, f"{len(found)} things, model {ms:.0f} ms", (6, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5,

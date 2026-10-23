@@ -9,6 +9,8 @@ of the frame; for each square three heads learn:
              square should match. Sprites the player can't see (dark, behind
              a wall) are neither right nor wrong answers there.
   something  whether any visible sprite is centred in the square
+  player     whether a visible player or other humanoid stands in the square
+             (the agent needs this most; species names are much harder)
   box        for the topmost visible sprite centred there: where its centre
              sits in the square and how big its box is
 
@@ -102,6 +104,7 @@ class Frames(torch.utils.data.Dataset):
         pos, ignore = [], []                          # (cell, text row)
         box = np.zeros((gh * gw, 4), np.float32)
         something = np.zeros(gh * gw, np.float32)
+        player = np.zeros(gh * gw, np.float32)
         top_depth = np.full(gh * gw, -1e9)
         for s in f["sprites"]:
             bx0, by0, bx1, by1 = s["box"]
@@ -114,6 +117,8 @@ class Frames(torch.utils.data.Dataset):
                 (pos if s["visible"] else ignore).append((cell, row))
             if s["visible"]:
                 something[cell] = 1
+                if s.get("humanoid"):
+                    player[cell] = 1
                 if s["draw_depth"] >= top_depth[cell]:
                     top_depth[cell] = s["draw_depth"]
                     box[cell] = [(cx % CELL) / CELL, (cy % CELL) / CELL,
@@ -121,13 +126,15 @@ class Frames(torch.utils.data.Dataset):
         return {"image": torch.from_numpy(img.transpose(2, 0, 1).copy()),
                 "pos": torch.tensor(pos, dtype=torch.long).reshape(-1, 2),
                 "ignore": torch.tensor(ignore, dtype=torch.long).reshape(-1, 2),
-                "something": torch.from_numpy(something), "box": torch.from_numpy(box)}
+                "something": torch.from_numpy(something), "player": torch.from_numpy(player),
+                "box": torch.from_numpy(box)}
 
 
 def collate(items: list[dict]) -> dict:
     cells = items[0]["something"].shape[0]
     out = {"image": torch.stack([it["image"] for it in items]),
            "something": torch.cat([it["something"] for it in items]),
+           "player": torch.cat([it["player"] for it in items]),
            "box": torch.cat([it["box"] for it in items])}
     for key in ("pos", "ignore"):
         pairs = [it[key] + torch.tensor([b * cells, 0]) for b, it in enumerate(items)]
@@ -142,6 +149,7 @@ class DetectModel(nn.Module):
         self.text_proj = nn.Linear(text_dim, EMBED_DIM)
         self.name = nn.Sequential(nn.Linear(EMBED_DIM, EMBED_DIM), nn.GELU(), nn.Linear(EMBED_DIM, EMBED_DIM))
         self.something = nn.Linear(EMBED_DIM, 1)
+        self.player = nn.Linear(EMBED_DIM, 1)
         self.box = nn.Sequential(nn.Linear(EMBED_DIM, EMBED_DIM), nn.GELU(), nn.Linear(EMBED_DIM, 4))
         self.scale = nn.Parameter(torch.tensor(math.log(10.0)))
         self.bias = nn.Parameter(torch.tensor(-10.0))
@@ -165,7 +173,7 @@ class DetectModel(nn.Module):
         # The name head starts as a residual on stage 1's tile vectors.
         q = F.normalize(t + self.name(t), dim=-1)
         b = self.box(t)
-        return {"names": q, "something": self.something(t).squeeze(1),
+        return {"names": q, "something": self.something(t).squeeze(1), "player": self.player(t).squeeze(1),
                 "box": torch.cat([torch.sigmoid(b[:, :2]), b[:, 2:]], 1), "grid": tiles.shape[1:3]}
 
 
@@ -209,9 +217,13 @@ def losses(model: DetectModel, out: dict, b: dict, generator: torch.Generator | 
     weight[pos_cell, pos_col] = 1
     names = (F.binary_cross_entropy_with_logits(logits, target, weight, reduction="sum") / n_cells)
     something = F.binary_cross_entropy_with_logits(out["something"], b["something"])
+    # Players are rare squares, so their misses count more.
+    player = F.binary_cross_entropy_with_logits(out["player"], b["player"],
+                                                pos_weight=torch.tensor(10.0, device=dev))
     m = b["something"]
     box = (F.smooth_l1_loss(out["box"], b["box"], reduction="none", beta=0.1).sum(1) * m).sum() / m.sum().clamp(min=1)
-    return {"names": names, "something": something, "box": box, "total": names + something + box}
+    return {"names": names, "something": something, "player": player, "box": box,
+            "total": names + something + player + box}
 
 
 @torch.no_grad()
@@ -220,7 +232,7 @@ def evaluate(model: DetectModel, loader, device, stop=lambda: False) -> dict:
     precision and recall at 0.5, and box overlap where both agree."""
     model.eval()
     all_t = model.texts()
-    h1 = h5 = named = tp = fp = fn = 0
+    h1 = h5 = named = tp = fp = fn = ptp = pfp = pfn = 0
     ious = []
     for b in loader:
         if stop():
@@ -233,6 +245,10 @@ def evaluate(model: DetectModel, loader, device, stop=lambda: False) -> dict:
             h1 += int(hit[:, 0].sum())
             h5 += int(hit.any(1).sum())
             named += len(b["pos"])
+        pg, pt = out["player"] > 0, b["player"] > 0
+        ptp += int((pg & pt).sum())
+        pfp += int((pg & ~pt).sum())
+        pfn += int((~pg & pt).sum())
         guess = out["something"] > 0
         truth = b["something"] > 0
         tp += int((guess & truth).sum())
@@ -245,6 +261,7 @@ def evaluate(model: DetectModel, loader, device, stop=lambda: False) -> dict:
     iou = torch.cat(ious) if ious else torch.zeros(0)
     return {"name_top1": h1 / max(1, named), "name_top5": h5 / max(1, named), "named_sprites": named,
             "something_precision": tp / max(1, tp + fp), "something_recall": tp / max(1, tp + fn),
+            "player_precision": ptp / max(1, ptp + pfp), "player_recall": ptp / max(1, ptp + pfn),
             "box_iou": float(iou.mean()) if len(iou) else 0.0,
             "box_iou_over_half": float((iou > 0.5).float().mean()) if len(iou) else 0.0}
 
@@ -313,8 +330,12 @@ def train_detect(opts: DetectOptions, progress: Progress | None = None) -> dict:
                               weight_decay=opts.weight_decay)
     step = 0
     if source is out:
-        model.load_state_dict(ckpt["model"])
-        optim.load_state_dict(ckpt["optim"])
+        # Models from before the player head resume with a fresh one.
+        model.load_state_dict(ckpt["model"], strict=False)
+        try:
+            optim.load_state_dict(ckpt["optim"])
+        except ValueError:
+            print("detect: this model has a new head since it was saved, so the optimiser starts afresh", flush=True)
         step = ckpt["step"]
         print(f"detect: resumed {latest} at step {step:,}", flush=True)
     else:
@@ -338,7 +359,8 @@ def train_detect(opts: DetectOptions, progress: Progress | None = None) -> dict:
         if scores:
             print(f"detect: step {step:,}: naming {scores['name_top1']:.1%} / {scores['name_top5']:.1%} "
                   f"(top 1 / top 5) on {scores['named_sprites']:,} held-out sprites; something "
-                  f"{scores['something_precision']:.1%} precise, {scores['something_recall']:.1%} found; "
+                  f"{scores['something_precision']:.1%} precise, {scores['something_recall']:.1%} found; players "
+                  f"{scores['player_precision']:.1%} precise, {scores['player_recall']:.1%} found; "
                   f"box overlap {scores['box_iou']:.2f}", flush=True)
         return row
 
