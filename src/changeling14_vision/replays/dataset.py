@@ -7,7 +7,8 @@ Reads recording folders (from `replays record`) and writes:
 
 Each picture is shrunk back to the game's own 32 pixels per tile (the client
 draws at a multiple of that). For every sprite it keeps the box in the shrunk
-picture and three flags:
+picture, its centre (the middle of the box), its origin (where the entity
+stands, which differs for wall-mounted things) and three flags:
 
   blocked   a wall is in the way (from the recorder)
   dark      the box is almost black in the picture: unlit, or outside the
@@ -101,13 +102,16 @@ def build_dataset(recordings: list[Path], out: Path, library_rows: dict[str, dic
             x0, y0, x1, y1 = (v / s for v in e["box"])
             cx0, cy0 = max(0, int(x0)), max(0, int(y0))
             cx1, cy1 = min(w, int(np.ceil(x1))), min(h, int(np.ceil(y1)))
-            if cx1 <= cx0 or cy1 <= cy0:
+            if cx1 - cx0 < 2 or cy1 - cy0 < 2:       # (almost) outside the picture
                 continue
             dark = float(pixels[cy0:cy1, cx0:cx1].mean()) < DARK
             sprites.append({
                 "prototype": e["prototype"], "name": e["name"],
                 "box": [round(x0, 1), round(y0, 1), round(x1, 1), round(y1, 1)],
-                "center": [round(e["center"][0] / s, 1), round(e["center"][1] / s, 1)],
+                # The middle of what is drawn. Wall-mounted things (lights, signs) are
+                # drawn on the wall but stand on the floor tile next to it (origin).
+                "center": [round((x0 + x1) / 2, 1), round((y0 + y1) / 2, 1)],
+                "origin": [round(e["center"][0] / s, 1), round(e["center"][1] / s, 1)],
                 "draw_depth": e["draw_depth"], "blocked": e["blocked"], "dark": dark,
                 "visible": not e["blocked"] and not dark,
                 "humanoid": e["humanoid"], "alive": e["alive"], "subject": e["subject"],
