@@ -37,6 +37,7 @@ from .text import DEFAULT_TEXT_MODEL, TextTable, build_text_table
 from .watch import WATCHSET_SIZE, draw_watchset, pick_watchset
 
 EVAL_LIMIT = 2048
+CAPTURE_PICTURES = 2048            # schedule-free: pictures that re-measure batch-norm statistics
 
 
 @dataclass
@@ -341,11 +342,24 @@ class WeightAverage:
             if isinstance(module, nn.modules.batchnorm._BatchNorm):
                 module.reset_running_stats()
                 module.momentum = None          # a plain average over the batches below
-        for n, b in enumerate(loader):
-            if n >= batches:
-                break
-            self.model(b["x"].to(device))
+        with torch.no_grad():
+            for n, b in enumerate(loader):
+                if n >= batches:
+                    break
+                self.model(b["x"].to(device))
         self.model.eval()
+
+
+def _memory_note(device) -> str:
+    """GPU memory in use, so a slowdown can be told apart from memory growth."""
+    try:
+        if device.type == "mps":
+            return f", GPU memory {torch.mps.driver_allocated_memory() / 2**30:.1f} GB"
+        if device.type == "cuda":
+            return f", GPU memory {torch.cuda.memory_reserved(device) / 2**30:.1f} GB"
+    except (AttributeError, RuntimeError):
+        pass
+    return ""
 
 
 def _name_hits(z: torch.Tensor, wanted: torch.Tensor, all_text: torch.Tensor) -> tuple[int, int, int]:
@@ -578,8 +592,10 @@ def train(opts: TrainOptions, progress: Progress | None = None) -> dict:
         # On a stop request, save straight away: the app kills the job after ~15 s.
         scores = {"unseen": {}, "newview": {}, "tiles": {}}
         if opts.optimizer == "schedulefree":
+            # About 2,048 pictures (512 on a stop) whatever the batch size.
+            pictures = 512 if reason == "stop" else CAPTURE_PICTURES
             average.capture(model, optim, _loader(train_ds, opts.batch, True, 0, step), device,
-                            batches=4 if reason == "stop" else 16)
+                            batches=max(1, round(pictures / opts.batch)))
         if reason != "stop":
             progress.update("evaluate", step, opts.steps, "scoring held-out sprites", force=True)
             stop = lambda: progress.stop_requested
@@ -636,6 +652,7 @@ def train(opts: TrainOptions, progress: Progress | None = None) -> dict:
     stopped = False
     if step == 0:
         last_row = checkpoint("start")
+        last_ckpt_time = t0 = time.time()
     while step < opts.steps and not stopped:
         for batch in loader:
             if progress.stop_requested or (opts.minutes and time.time() - started > opts.minutes * 60):
@@ -676,6 +693,7 @@ def train(opts: TrainOptions, progress: Progress | None = None) -> dict:
                 window.extend(torch.stack(pending).tolist())
                 pending.clear()
                 del window[:-100]
+            # Step time since the last checkpoint, so checkpoints don't inflate it.
             rate = (time.time() - t0) / max(1, step - step0)
             speed = f"{1 / rate * opts.batch:.0f} img/s"
             progress.update("train", step, opts.steps, f"loss {avg_loss():.3f}, {speed}" if window else speed,
@@ -685,8 +703,11 @@ def train(opts: TrainOptions, progress: Progress | None = None) -> dict:
                       f"{rate * 1000:.0f} ms/step", flush=True)
             if (step % opts.checkpoint_every == 0
                     or time.time() - last_ckpt_time > opts.checkpoint_minutes * 60):
+                began = time.time()
                 last_row = checkpoint("interval")
-                last_ckpt_time = time.time()
+                last_ckpt_time = t0 = time.time()
+                step0 = step
+                print(f"checkpoint took {last_ckpt_time - began:.0f} s{_memory_note(device)}", flush=True)
             if step >= opts.steps:
                 break
     if not last_row or last_row["step"] != step:
