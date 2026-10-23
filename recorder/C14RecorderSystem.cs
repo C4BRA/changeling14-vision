@@ -38,20 +38,20 @@ using SixLabors.ImageSharp.PixelFormats;
 
 namespace Content.Client.Replay.C14;
 
-public sealed class C14RecorderSystem : EntitySystem
+public sealed partial class C14RecorderSystem : EntitySystem
 {
-    [Dependency] private readonly IResourceManager _res = default!;
-    [Dependency] private readonly IReplayLoadManager _load = default!;
-    [Dependency] private readonly IReplayPlaybackManager _playback = default!;
-    [Dependency] private readonly IStateManager _states = default!;
-    [Dependency] private readonly IEyeManager _eye = default!;
-    [Dependency] private readonly IGameController _game = default!;
-    [Dependency] private readonly ReplaySpectatorSystem _spectator = default!;
-    [Dependency] private readonly SpriteSystem _sprite = default!;
-    [Dependency] private readonly SharedTransformSystem _transform = default!;
-    [Dependency] private readonly SharedContainerSystem _containers = default!;
-    [Dependency] private readonly ExamineSystemShared _examine = default!;
-    [Dependency] private readonly MobStateSystem _mobs = default!;
+    [Dependency] private IResourceManager _res = default!;
+    [Dependency] private IReplayLoadManager _load = default!;
+    [Dependency] private IReplayPlaybackManager _playback = default!;
+    [Dependency] private IStateManager _states = default!;
+    [Dependency] private IEyeManager _eye = default!;
+    [Dependency] private IGameController _game = default!;
+    [Dependency] private ReplaySpectatorSystem _spectator = default!;
+    [Dependency] private SpriteSystem _sprite = default!;
+    [Dependency] private SharedTransformSystem _transform = default!;
+    [Dependency] private SharedContainerSystem _containers = default!;
+    [Dependency] private ExamineSystemShared _examine = default!;
+    [Dependency] private MobStateSystem _mobs = default!;
 
     private static readonly ResPath Root = new("/c14-recorder");
     private static readonly ResPath JobFile = Root / "job.txt";
