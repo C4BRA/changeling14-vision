@@ -2,8 +2,14 @@
 
 Reads recording folders (from `replays record`) and writes:
 
-  <out>/dataset.json                 the frames, their split and their sprites
+  <out>/dataset.json                 the frames and their split (labels.py)
+  <out>/sprites.npz                  every frame's sprites, as compact arrays
   <out>/frames/<recording>/<name>.png
+
+The new dataset is built in .<name>.building next to <out> and only then
+swapped in; the dataset it replaces is kept as .<name>.previous (one
+generation), so a failed or stopped build never leaves a half-written dataset
+behind. Both are hidden, so lists of datasets can skip them.
 
 Each picture is shrunk back to the game's own 32 pixels per tile (the client
 draws at a multiple of that). For every sprite it keeps the box in the shrunk
@@ -34,12 +40,14 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+from .labels import LabelWriter, load
+
 TILE = 32
 DARK = 12 / 255           # mean brightness below this counts as dark
 REPEAT = 4 / 255          # mean difference below this counts as a repeat
 FAINT = 12 / 255          # floor-level sprites differing less than this from around them can't be seen,
 FAINT_PEAK = 22 / 255     # unless their most different pixels (95th percentile) differ more than this
-FLOOR_LEVEL = -5          # draw depths up to HighFloorObjects (puddles, pipes, cables, decals)
+FLOOR_LEVEL = -11         # draw depths up to HighFloorObjects (puddles, pipes, cables, decals)
 BLACK = 0.95              # pictures with more near-black pixels than this show nothing to learn
 
 
@@ -109,15 +117,21 @@ def build_dataset(recordings: list[Path], out: Path, library_rows: dict[str, dic
     rounds = sorted({_round_of(r, library_rows) for r in recordings})
     test_rounds = pick_holdout(rounds, holdout)
 
-    frames_out = out / "frames"
-    shutil.rmtree(frames_out, ignore_errors=True)
+    final = out
+    out = final.with_name(f".{final.name}.building")
+    shutil.rmtree(out, ignore_errors=True)
+    out.mkdir(parents=True)
+    writer = LabelWriter()
+    stopped = False
     frames, repeats, blacks, other_view = [], 0, 0, 0
+    sprites_total = visible_total = faint_total = 0
     keys = [(rec, k) for rec in recordings for k in sorted((rec / "frames").glob("*.json"))]
     last: dict[tuple[str, int], np.ndarray] = {}
     for n, (rec, key_path) in enumerate(keys):
         if progress:
             progress.update("build dataset", n, len(keys), key_path.name)
             if progress.stop_requested:
+                stopped = True
                 break
         key = json.loads(key_path.read_text(encoding="utf-8"))
         img = Image.open(key_path.with_name(key["picture"])).convert("RGB")
@@ -171,26 +185,35 @@ def build_dataset(recordings: list[Path], out: Path, library_rows: dict[str, dic
         (out / rel).parent.mkdir(parents=True, exist_ok=True)
         img.save(out / rel)
         round_id = _round_of(rec, library_rows)
+        first, count = writer.add(sprites)
+        sprites_total += count
+        visible_total += sum(sp["visible"] for sp in sprites)
+        faint_total += sum(sp["faint"] for sp in sprites)
         frames.append({"picture": str(rel), "recording": rec.name, "round": round_id,
                        "split": "test" if round_id in test_rounds else "train",
                        "time": key["time"], "tick": key["tick"], "width": w, "height": h,
-                       "eye_rotation": key["eye_rotation"], "sprites": sprites})
+                       "eye_rotation": key["eye_rotation"], "first": first, "count": count})
 
     summary = {
         "frames": len(frames), "repeats_dropped": repeats, "black_dropped": blacks, "other_view_dropped": other_view,
         "rounds": rounds, "test_rounds": sorted(test_rounds),
         "train_frames": sum(f["split"] == "train" for f in frames),
         "test_frames": sum(f["split"] == "test" for f in frames),
-        "sprites": sum(len(f["sprites"]) for f in frames),
-        "visible_sprites": sum(sum(s["visible"] for s in f["sprites"]) for f in frames),
-        "faint_sprites": sum(sum(s.get("faint", False) for s in f["sprites"]) for f in frames),
+        "sprites": sprites_total, "visible_sprites": visible_total, "faint_sprites": faint_total,
     }
-    out.mkdir(parents=True, exist_ok=True)
-    tmp = out / "dataset.json.tmp"
-    tmp.write_text(json.dumps({"version": 1, "tile": TILE, "summary": summary, "frames": frames}),
-                   encoding="utf-8")
-    tmp.replace(out / "dataset.json")
+    if stopped:
+        # The dataset already in place (if any) stays as it was.
+        shutil.rmtree(out, ignore_errors=True)
+        return {**summary, "stopped": True}
+    writer.labels().save(out / "sprites.npz")
+    (out / "dataset.json").write_text(json.dumps({"version": 2, "tile": TILE, "summary": summary,
+                                                  "frames": frames}), encoding="utf-8")
     write_dataset_report(out)
+    previous = final.with_name(f".{final.name}.previous")
+    if final.exists():
+        shutil.rmtree(previous, ignore_errors=True)
+        final.rename(previous)
+    out.rename(final)
     if progress:
         progress.update("build dataset", len(keys), len(keys), f"{len(frames)} frames", force=True)
     return summary
@@ -199,23 +222,24 @@ def build_dataset(recordings: list[Path], out: Path, library_rows: dict[str, dic
 def write_dataset_report(out: Path, limit: int = 120) -> Path:
     import html
 
-    data = json.loads((out / "dataset.json").read_text(encoding="utf-8"))
+    data, labels = load(out)
     figs = []
     for f in data["frames"][:limit]:
         rects = []
-        for s in sorted(f["sprites"], key=lambda s: s["draw_depth"]):
+        sprites = labels.dicts(f)
+        for s in sorted(sprites, key=lambda s: s["draw_depth"]):
             x0, y0, x1, y1 = s["box"]
             colour = "#ffd400" if s["subject"] else "#3c3" if s["visible"] else "#38f" if s["dark"] else "#999"
             dash = "" if s["visible"] or s["subject"] else ' stroke-dasharray="2 2"'
             title = html.escape(f"{s['name']} ({s['prototype']})")
             rects.append(f'<rect x="{x0}" y="{y0}" width="{x1 - x0}" height="{y1 - y0}" fill="none" '
                          f'stroke="{colour}" stroke-width="0.7"{dash}><title>{title}</title></rect>')
-        seen = sum(s["visible"] for s in f["sprites"])
+        seen = sum(s["visible"] for s in sprites)
         figs.append(
             f'<figure><div class="pic" style="aspect-ratio:{f["width"]}/{f["height"]}">'
             f'<img src="{html.escape(f["picture"])}"><svg viewBox="0 0 {f["width"]} {f["height"]}">'
             f'{"".join(rects)}</svg></div><figcaption>{html.escape(f["picture"])} ({f["split"]}): '
-            f'{seen} of {len(f["sprites"])} sprites visible</figcaption></figure>')
+            f'{seen} of {len(sprites)} sprites visible</figcaption></figure>')
     s = data["summary"]
     page = f"""<!doctype html><meta charset="utf-8"><title>Replay dataset</title>
 <style>

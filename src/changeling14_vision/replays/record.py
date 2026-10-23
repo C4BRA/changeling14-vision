@@ -122,9 +122,11 @@ def write_job(path: Path, **settings) -> None:
 
 def record(replay: Path, client: Path, out: Path, interval_s: float = 30, players_per_moment: int = 2,
            settle_frames: int = 12, max_pictures: int | None = None, start_s: float | None = None,
-           end_s: float | None = None, seed: int = 1, timeout_s: float = 6 * 3600, progress=None,
-           log=print) -> dict:
-    """Play one replay in the client and collect its pictures into out/frames."""
+           end_s: float | None = None, seed: int = 1, timeout_s: float = 6 * 3600,
+           load_timeout_s: float = 600, progress=None, log=print) -> dict:
+    """Play one replay in the client and collect its pictures into out/frames.
+    The client is stopped if the replay hasn't loaded after load_timeout_s (a
+    client stuck on its loading screen otherwise holds the job for hours)."""
     replay, client, out = Path(replay).expanduser(), Path(client), Path(out).expanduser()
     root = user_data_dir() / "c14-recorder"
     if (root / "job.txt").exists():
@@ -151,9 +153,15 @@ def record(replay: Path, client: Path, out: Path, interval_s: float = 30, player
             proc = subprocess.Popen(_client_command(client), cwd=client, stdout=client_log,
                                     stderr=subprocess.STDOUT)
             note = "starting the client"
+            loaded = False
             while proc.poll() is None:
                 time.sleep(2)
                 note = _first_line(root / "progress.txt") or note
+                loaded = loaded or not note.startswith(("starting", "job read", "loading"))
+                if not loaded and time.time() - started > load_timeout_s:
+                    proc.terminate()
+                    raise RecordError(f"the replay hadn't loaded after {load_timeout_s:.0f} s (last: {note}); "
+                                      f"see {out / 'client.log'}")
                 saved = len(list((root / "out").glob("*.png"))) if (root / "out").is_dir() else 0
                 if progress:
                     progress.update("record", saved, max_pictures or 0, f"{replay.name}: {note}")

@@ -256,16 +256,33 @@ def test_replay_dataset_shrinks_marks_dark_and_holds_out_rounds(tmp_path):
                 {"picture": f"{i:05d}-5.png", "tick": i, "time": i * 30.0, "subject": 5, "eye_rotation": 0,
                  "zoom": 1, "width": 1344, "height": 960, "entities": ents}))
         recs.append(tmp_path / rec)
+    from changeling14_vision.replays.labels import load
+
     s = build_dataset(recs, tmp_path / "out", holdout=["roundB"])
     assert (s["frames"], s["repeats_dropped"], s["test_frames"]) == (4, 2, 2)
-    data = json.loads((tmp_path / "out" / "dataset.json").read_text())
+    data, labels = load(tmp_path / "out")
+    assert data["version"] == 2 and "sprites" not in data["frames"][0]
     f = data["frames"][0]
     assert (f["width"], f["height"]) == (672, 480)
-    lit, dark = f["sprites"]
-    assert lit["box"] == [0.0, 0.0, 32.0, 32.0] and lit["visible"]
+    lit, dark = labels.dicts(f)
+    assert lit["box"] == [0.0, 0.0, 32.0, 32.0] and lit["visible"] and lit["prototype"] == "WallSolid"
     assert dark["dark"] and not dark["visible"]
     assert not lit["faint"]
     assert (tmp_path / "out" / "report.html").is_file()
+
+    # A rebuild is made aside and swapped in; the old one is kept once.
+    build_dataset(recs[:1], tmp_path / "out", holdout=[])
+    assert load(tmp_path / "out")[0]["summary"]["frames"] == 2
+    assert load(tmp_path / ".out.previous")[0]["summary"]["frames"] == 4
+    assert not (tmp_path / ".out.building").exists()
+
+    class Stop:
+        stop_requested = False
+
+        def update(self, *a, **k):
+            self.stop_requested = True
+    assert build_dataset(recs, tmp_path / "out", holdout=[], progress=Stop())["stopped"]
+    assert load(tmp_path / "out")[0]["summary"]["frames"] == 2           # left as it was
 
 
 def test_faint_floor_sprites():
@@ -322,13 +339,60 @@ def test_detect_trains_from_a_stage1_model(tmp_path):
     (ds / "dataset.json").write_text(json.dumps({"version": 1, "frames": frames}))
 
     opts = DetectOptions(dataset=ds, start=start, out=tmp_path / "det", steps=3, batch=2, workers=0,
-                         device="cpu", checkpoint_every=2, warmup=1)
+                         device="cpu", checkpoint_every=2, warmup=1, keep_checkpoints=2)
     row = train_detect(opts)
     assert row["step"] == 3 and "name_top1" in row and row["named_sprites"] == 1
-    assert (tmp_path / "det" / "checkpoints" / "step-2.pt").is_file()
+    assert row["seen_sprites"] == 1 and row["unseen_sprites"] == 0 and row["sprites_walls"] == 0
+    assert "name_set_precision" in row and "top5_followed_player" in row
+    # Two newest kept (step 2, 3) plus the best; step 0 goes unless it was the best.
+    kept = {p.name for p in (tmp_path / "det" / "checkpoints").glob("*.pt")}
+    assert {"step-2.pt", "step-3.pt"} <= kept and len(kept) <= 3
+    ckpt = torch.load(tmp_path / "det" / "latest.pt", weights_only=False)
+    assert "ema" in ckpt and ckpt["dataset_hash"]
     # Resuming continues from the saved step.
     opts.steps = 4
     assert train_detect(opts)["step"] == 4
+    # ...but not on a rebuilt dataset, unless asked to.
+    (ds / "dataset.json").write_text(json.dumps({"version": 1, "frames": frames, "note": "rebuilt"}))
+    opts.steps = 5
+    with pytest.raises(SystemExit, match="another version"):
+        train_detect(opts)
+    opts.allow_new_data = True
+    assert train_detect(opts)["step"] == 5
+
+
+def test_detect_frames_targets(tmp_path):
+    import numpy as np
+    from PIL import Image
+
+    from changeling14_vision.replays.detect import Frames
+
+    class Table:
+        row_of_entity = {"WallSolid": 0, "Poweredlight": 1, "Airlock": 2}
+        texts = ["wall", "light", "airlock"]
+
+    (tmp_path / "frames").mkdir()
+    Image.fromarray(np.full((480, 672, 3), 120, np.uint8)).save(tmp_path / "frames" / "0.png")
+    base = {"draw_depth": 0, "blocked": False, "dark": False, "humanoid": False, "alive": False, "subject": False}
+    sprites = [{**base, "prototype": "WallSolid", "box": [0, 0, 32, 32], "draw_depth": -8, "visible": True},
+               {**base, "prototype": "Poweredlight", "box": [64, 64, 96, 96], "draw_depth": 2, "visible": False,
+                "dark": True},
+               {**base, "prototype": "MobHuman", "box": [320, 224, 352, 256], "draw_depth": 6, "visible": True,
+                "humanoid": True, "subject": True}]
+    (tmp_path / "dataset.json").write_text(json.dumps({"version": 1, "frames": [
+        {"picture": "frames/0.png", "split": "test", "width": 672, "height": 480, "sprites": sprites}]}))
+    ds = Frames(tmp_path, "test", Table, None)
+    it = ds[0]
+    gw = 672 // 32
+    assert it["pos"].tolist() == [[0, 0]] and it["ignore"].tolist() == [[2 * gw + 2, 1]]
+    assert it["pos_group"].tolist() == [1]                       # walls
+    assert it["mask"][2 * gw + 2] == 0 and it["mask"][0] == 1    # only a hidden light there
+    assert it["subject"][7 * gw + 10] == 1 and it["player"][7 * gw + 10] == 1
+    assert ds.trained_rows().tolist() == [0]
+    # Training augments: crops stay 480 x 480 and lighting changes.
+    aug = Frames(tmp_path, "test", Table, 480, augment=True)
+    shapes = {tuple(aug[0]["image"].shape) for _ in range(10)}
+    assert shapes == {(3, 480, 480)}
 
 
 def test_predict_report_from_a_replay_model(tmp_path):
@@ -338,3 +402,16 @@ def test_predict_report_from_a_replay_model(tmp_path):
     page = predict_report(tmp_path / "det", tmp_path / "ds", device="cpu", threshold=0.0)
     text = page.read_text()
     assert "held-out frames" in text and "<figure>" in text
+
+
+def test_prune_checkpoints_keeps_newest_and_best(tmp_path):
+    from changeling14_vision.pretrain.train import prune_checkpoints
+
+    for step in (0, 100, 200, 300, 400):
+        (tmp_path / f"step-{step:07d}.pt").write_bytes(b"x")
+    rows = [{"step": s, "score": v} for s, v in ((0, 0.1), (100, 0.9), (200, 0.2), (300, 0.3), (400, None))]
+    (tmp_path / "metrics.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\nnot json\n")
+    prune_checkpoints(tmp_path, 2, "score", tmp_path / "metrics.jsonl")
+    assert sorted(p.name for p in tmp_path.glob("*.pt")) == ["step-0000100.pt", "step-0000300.pt", "step-0000400.pt"]
+    prune_checkpoints(tmp_path, 0, "score", tmp_path / "metrics.jsonl")      # 0 keeps all
+    assert len(list(tmp_path.glob("*.pt"))) == 3

@@ -80,6 +80,9 @@ def _resolve_train_settings(args, resuming: bool) -> None:
     for name, default in KEPT.items():
         if getattr(args, name) is None:
             setattr(args, name, cfg.get(name, default))
+    if args.keep_checkpoints is None:
+        # Folders from before this setting kept every checkpoint, and still do.
+        args.keep_checkpoints = cfg.get("keep_checkpoints", 0) if cfg else 5
 
 
 def cmd_sprites(args) -> int:
@@ -115,7 +118,7 @@ def cmd_train(args) -> int:
                         checkpoint_every=args.checkpoint_every, checkpoint_minutes=args.checkpoint_minutes,
                         optimizer=args.optimizer, minutes=args.minutes, device=args.device, seed=args.seed, fresh=args.fresh,
                         amp=args.amp, text_model=None if args.no_text else args.text_model,
-                        rich_text=args.rich_text, dedup=args.dedup)
+                        rich_text=args.rich_text, dedup=args.dedup, keep_checkpoints=args.keep_checkpoints)
     progress = Progress(args.run_dir)
     progress.catch_stop()
     print(f"train: sprites from {opts.data}, model folder {opts.out}", flush=True)
@@ -240,6 +243,9 @@ def cmd_replays_dataset(args) -> int:
     progress.catch_stop()
     holdout = args.holdout.split(",") if args.holdout is not None else None
     s = build_dataset(recordings, Path(args.out), rows, holdout, progress)
+    if s.get("stopped"):
+        print("dataset: stopped; the dataset that was there is unchanged", flush=True)
+        return 143
     print(f"dataset: {s['frames']} frames ({s['train_frames']} train, {s['test_frames']} test, "
           f"test rounds {', '.join(s['test_rounds']) or 'none'}), dropped {s['repeats_dropped']} near-repeats, "
           f"{s['black_dropped']} black and {s.get('other_view_dropped', 0)} zoomed pictures, "
@@ -259,7 +265,8 @@ def cmd_replays_train(args) -> int:
         start = models / args.start
     opts = DetectOptions(dataset=Path(args.dataset).expanduser(), start=start, out=models / args.name,
                          steps=args.steps, batch=args.batch, workers=args.workers, device=args.device,
-                         minutes=args.minutes)
+                         minutes=args.minutes, keep_checkpoints=args.keep_checkpoints,
+                         allow_new_data=args.allow_new_data, allow_different_start=args.allow_different_start)
     progress = Progress(args.run_dir)
     progress.catch_stop()
     row = train_detect(opts, progress)
@@ -334,6 +341,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="also checkpoint at least this often (default 15)")
     p.add_argument("--minutes", type=float, help="stop cleanly after this many minutes; run again to resume")
     p.add_argument("--fresh", action="store_true", help="start over instead of resuming latest.pt")
+    p.add_argument("--keep-checkpoints", type=int,
+                   help="newest checkpoints to keep, plus the best one; 0 keeps all (default: 5 for a new "
+                        "model folder, the folder's own setting when resuming)")
     p.add_argument("--text-model", default="sentence-transformers/all-MiniLM-L6-v2",
                    help="sentence model for matching sprites to entity names (downloaded once)")
     p.add_argument("--no-text", action="store_true", help="train without text matching")
@@ -411,6 +421,13 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--minutes", type=float, help="stop cleanly after this long")
     r.add_argument("--workers", type=int, default=2, help="picture loading processes (default 2)")
     r.add_argument("--device", default="auto", help="auto, mps, cuda or cpu (default auto)")
+    r.add_argument("--keep-checkpoints", type=int,
+                   help="newest checkpoints to keep, plus the best one; 0 keeps all (default: 5 for a new "
+                        "model, the model's own setting when resuming)")
+    r.add_argument("--allow-new-data", action="store_true",
+                   help="resume although the dataset was rebuilt or is another one")
+    r.add_argument("--allow-different-start", action="store_true",
+                   help="resume although --from names another stage-1 model than the one it started from")
     r.set_defaults(func=cmd_replays_train)
     r = rsub.add_parser("predict", help="draw a replay model's guesses next to the answers on held-out frames")
     r.add_argument("model", help="replay model folder name (inside --models) or path")

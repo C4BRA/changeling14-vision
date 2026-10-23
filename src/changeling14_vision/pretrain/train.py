@@ -4,7 +4,8 @@ Writes into the training folder (--out):
   index.json            labels and splits, fixed for the life of this folder
   config.json           the options this folder was started with
   latest.pt             model, heads, optimizer and step: what a resume loads
-  checkpoints/step-N.pt weights at every checkpoint, all kept for rollback
+  checkpoints/step-N.pt weights at the newest checkpoints (--keep-checkpoints)
+                        and the best-scoring one, for rollback
   metrics.jsonl         one line per checkpoint: losses and held-out scores
 
 and, when a run folder is set, status.json, metrics.jsonl and one watch-set
@@ -64,6 +65,7 @@ class TrainOptions:
     dedup: bool = True                 # identical pictures count once (data.py); new models only
     ema: float = 0.999                 # decay of the weight average that is scored and saved
     optimizer: str = "adamw"           # adamw (cosine schedule) or schedulefree (no schedule)
+    keep_checkpoints: int = 5          # newest checkpoints kept, plus the best; 0 keeps all
 
     def __post_init__(self):
         # Batch 128 is the reference: bigger batches take proportionally fewer,
@@ -542,6 +544,34 @@ def _seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
 
 
+def prune_checkpoints(folder: Path, keep: int, metric: str | None, metrics_file: Path) -> None:
+    """Delete all but the newest `keep` step-N.pt files in folder, always
+    keeping the one that scored best on metric in metrics_file. 0 keeps all."""
+    if not keep:
+        return
+    def step_of(p: Path) -> int:
+        try:
+            return int(p.stem.split("-", 1)[1])
+        except (IndexError, ValueError):
+            return -1
+    files = sorted((p for p in folder.glob("step-*.pt") if step_of(p) >= 0), key=step_of)
+    best = None
+    if metric and metrics_file.is_file():
+        scored = []
+        for line in metrics_file.read_text(encoding="utf-8").splitlines():
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(r.get(metric), (int, float)):
+                scored.append(r)
+        if scored:
+            best = max(scored, key=lambda r: r[metric])["step"]
+    for p in files[:-keep]:
+        if step_of(p) != best:
+            p.unlink(missing_ok=True)
+
+
 def _save(path: Path, data: dict) -> None:
     tmp = path.with_name(path.name + ".tmp")
     torch.save(data, tmp)
@@ -700,6 +730,8 @@ def train(opts: TrainOptions, progress: Progress | None = None) -> dict:
         for target in filter(None, (out, progress.run_dir)):
             with open(target / "metrics.jsonl", "a", encoding="utf-8") as f:
                 f.write(json.dumps(row) + "\n")
+        prune_checkpoints(out / "checkpoints", opts.keep_checkpoints,
+                          "unseen_text_top5" if text else "unseen_category_top1", out / "metrics.jsonl")
         if progress.run_dir and reason != "stop":
             draw_watchset(average.model, opts.data, index, watch_items, device,
                           progress.run_dir / "watchset" / name, seed=opts.seed, text=text)

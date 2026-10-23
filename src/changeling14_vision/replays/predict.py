@@ -23,6 +23,7 @@ from ..model.encoder import Encoder
 from ..pretrain.text import TextTable
 from ..pretrain.train import load_checkpoint, pick_device
 from .detect import CELL, DetectModel, Frames, collate
+from .labels import load
 
 
 @dataclass
@@ -41,7 +42,8 @@ def load_detect_model(folder: Path, device: str = "auto") -> tuple[DetectModel, 
         raise SystemExit(f"{folder} is not a replay-trained model (train one with 'replays train')")
     table = TextTable(folder / "text.npz")
     model = DetectModel(Encoder(**{k: v for k, v in ckpt["encoder_config"].items() if k != "tile"}), table.dim)
-    model.load_state_dict(ckpt["model"], strict=False)
+    # The weight average is what was scored; models from before it have none.
+    model.load_state_dict(ckpt.get("ema") or ckpt["model"], strict=False)
     dev = pick_device(device)
     model.to(dev).eval()
     model.set_text(table)
@@ -96,7 +98,9 @@ def predict_report(folder: Path, dataset: Path, limit: int = 60, threshold: floa
     folder, dataset = Path(folder).expanduser(), Path(dataset).expanduser()
     model, table, dev = load_detect_model(folder, device)
     names = _names(table)
-    frames = Frames(dataset, "test", table, None)
+    source = load(dataset)
+    labels = source[1]
+    frames = Frames(dataset, "test", table, None, source=source)
     if not len(frames):
         raise SystemExit(f"{dataset} has no held-out frames")
     step = max(1, len(frames) // limit)
@@ -114,7 +118,7 @@ def predict_report(folder: Path, dataset: Path, limit: int = 60, threshold: floa
         item = collate([frames[i]])
         found = guesses(model, names, item["image"].to(dev), threshold, all_t=all_t)[0]
         gh, gw = f["height"] // CELL, f["width"] // CELL
-        truth = [s for s in f["sprites"] if s["visible"]]
+        truth = [s for s in labels.dicts({"first": f["dataset_first"], "count": f["count"]}) if s["visible"]]
         # Name check per square: the guessed name against the names truly centred there.
         by_cell: dict[int, set[str]] = {}
         for s in truth:
