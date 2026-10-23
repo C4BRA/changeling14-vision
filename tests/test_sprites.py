@@ -233,3 +233,35 @@ def test_replay_import_files_by_build_and_keeps_the_inbox(tmp_path):
     # Importing again adds nothing.
     assert main(["replays", "import", "--inbox", str(inbox), "--library", str(library)]) == 0
     assert len(load_library(library)) == 2
+
+
+def test_replay_dataset_shrinks_marks_dark_and_holds_out_rounds(tmp_path):
+    import numpy as np
+    from PIL import Image
+
+    from changeling14_vision.replays.dataset import build_dataset
+
+    recs = []
+    for rec in ("roundA", "roundB"):
+        frames = tmp_path / rec / "frames"
+        frames.mkdir(parents=True)
+        for i, shade in enumerate((200, 200, 240)):        # the second picture repeats the first
+            a = np.zeros((144, 192, 3), np.uint8)
+            a[:, :96] = shade
+            Image.fromarray(a).save(frames / f"{i:05d}-5.png")
+            ents = [{"uid": k, "prototype": "WallSolid", "name": "wall", "center": [48 + 96 * k, 48],
+                     "box": [96 * k, 0, 96 * k + 96, 96], "draw_depth": -10, "rotation": 0, "blocked": False,
+                     "alive": False, "humanoid": False, "subject": False} for k in range(2)]
+            (frames / f"{i:05d}-5.json").write_text(json.dumps(
+                {"picture": f"{i:05d}-5.png", "tick": i, "time": i * 30.0, "subject": 5, "eye_rotation": 0,
+                 "zoom": 1, "width": 192, "height": 144, "entities": ents}))
+        recs.append(tmp_path / rec)
+    s = build_dataset(recs, tmp_path / "out", holdout=["roundB"])
+    assert (s["frames"], s["repeats_dropped"], s["test_frames"]) == (4, 2, 2)
+    data = json.loads((tmp_path / "out" / "dataset.json").read_text())
+    f = data["frames"][0]
+    assert (f["width"], f["height"]) == (64, 48)
+    lit, dark = f["sprites"]
+    assert lit["box"] == [0.0, 0.0, 32.0, 32.0] and lit["visible"]
+    assert dark["dark"] and not dark["visible"]
+    assert (tmp_path / "out" / "report.html").is_file()

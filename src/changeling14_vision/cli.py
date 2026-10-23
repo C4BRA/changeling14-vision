@@ -24,6 +24,7 @@ DEFAULT_LIBRARY = "~/Desktop/SS13-14/replay-library"
 DEFAULT_CODEBASE = "~/Desktop/SS13-14/wizden-ss14"
 DEFAULT_CLIENTS = "~/Desktop/SS13-14/replay-clients"
 DEFAULT_RECORDINGS = "~/Desktop/SS13-14/replay-recordings"
+DEFAULT_REPLAY_DATASET = "~/Desktop/SS13-14/replay-dataset"
 TRAIN_DEPS = 'the training steps need PyTorch: pip install -e ".[train]"'
 
 
@@ -220,6 +221,31 @@ def cmd_replays_record(args) -> int:
     return 0 if result["finished"] and not result["error"] else 1
 
 
+def cmd_replays_dataset(args) -> int:
+    from .replays.dataset import build_dataset
+    from .replays.importer import load_library
+
+    rows = {Path(r["file"]).stem: r for r in load_library(Path(args.library).expanduser())}
+    base = Path(args.recordings).expanduser()
+    if args.recording:
+        recordings = [base / name for name in args.recording]
+    else:
+        # Only folders named after a library replay, so renamed copies are left out.
+        recordings = sorted(p for p in base.iterdir() if p.name in rows and (p / "frames").is_dir()) \
+            if base.is_dir() else []
+    if not recordings:
+        print(f"no recordings found in {base}", flush=True)
+        return 1
+    progress = Progress(args.run_dir)
+    progress.catch_stop()
+    holdout = args.holdout.split(",") if args.holdout is not None else None
+    s = build_dataset(recordings, Path(args.out), rows, holdout, progress)
+    print(f"dataset: {s['frames']} frames ({s['train_frames']} train, {s['test_frames']} test, "
+          f"test rounds {', '.join(s['test_rounds']) or 'none'}), {s['repeats_dropped']} near-repeats dropped, "
+          f"{s['visible_sprites']} of {s['sprites']} sprites visible -> {Path(args.out).expanduser()}", flush=True)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="changeling14-vision")
     parser.add_argument("--run-dir", help="report progress here (default: $C14_RUN_DIR)")
@@ -319,6 +345,13 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--end", type=float, help="last second of the replay to record")
     r.add_argument("--seed", type=int, default=1, help="picks which players are followed (default 1)")
     r.set_defaults(func=cmd_replays_record)
+    r = rsub.add_parser("dataset", help="turn recordings into a training dataset (frames, sprites, held-out rounds)")
+    r.add_argument("recording", nargs="*", help="recording folder names (default: every recorded library replay)")
+    r.add_argument("--recordings", default=DEFAULT_RECORDINGS, help=f"recordings folder (default {DEFAULT_RECORDINGS})")
+    r.add_argument("--library", default=DEFAULT_LIBRARY, help=f"replay library (default {DEFAULT_LIBRARY})")
+    r.add_argument("--out", default=DEFAULT_REPLAY_DATASET, help=f"output folder (default {DEFAULT_REPLAY_DATASET})")
+    r.add_argument("--holdout", help="comma-separated round ids kept for testing (default: about 1 in 5 rounds)")
+    r.set_defaults(func=cmd_replays_dataset)
 
     args = parser.parse_args(argv)
     return args.func(args)
