@@ -289,7 +289,8 @@ def cmd_replays_live(args) -> int:
     if region is not None and len(region) != 4:
         print("--region is left,top,width,height", flush=True)
         return 1
-    live(_replay_model(args), region, args.tile_px, args.threshold, args.device, args.fps, not args.no_labels)
+    live(_replay_model(args), region, args.tile_px, args.threshold, args.device, args.fps, not args.no_labels,
+         args.name_threshold)
     return 0
 
 
@@ -426,6 +427,8 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--tile-px", type=float, help="captured pixels per game tile (default: worked out)")
     r.add_argument("--threshold", type=float, default=0.5, help="how sure a square must be to count (default 0.5)")
     r.add_argument("--fps", type=float, default=10, help="pictures per second (default 10)")
+    r.add_argument("--name-threshold", type=float, default=0.6,
+                   help='show "?" instead of a name the model is less sure of (default 0.6)')
     r.add_argument("--no-labels", action="store_true", help="boxes only")
     r.add_argument("--device", default="auto", help="auto, mps, cuda or cpu (default auto)")
     r.set_defaults(func=cmd_replays_live)

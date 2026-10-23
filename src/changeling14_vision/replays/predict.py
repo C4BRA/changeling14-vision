@@ -80,6 +80,13 @@ def guesses(model: DetectModel, names: list[str], image: torch.Tensor, threshold
     return result
 
 
+def _true_name(sprite: dict, table: TextTable, names: list[str]) -> str:
+    """The catalogue name the model is taught for this sprite: its prototype's
+    text, not the in-game name (a player's character name can't be seen)."""
+    row = table.row_of_entity.get(sprite["prototype"])
+    return (names[row] if row is not None else sprite["name"]).lower()
+
+
 def predict_report(folder: Path, dataset: Path, limit: int = 60, threshold: float = 0.5,
                    device: str = "auto", progress=None) -> Path:
     """predictions.html: held-out frames, true visible sprites (green) beside
@@ -111,12 +118,12 @@ def predict_report(folder: Path, dataset: Path, limit: int = 60, threshold: floa
         for s in truth:
             cx, cy = (s["box"][0] + s["box"][2]) / 2, (s["box"][1] + s["box"][3]) / 2
             if 0 <= cx < gw * CELL and 0 <= cy < gh * CELL:
-                by_cell.setdefault(int(cy // CELL) * gw + int(cx // CELL), set()).add(s["name"].lower())
+                by_cell.setdefault(int(cy // CELL) * gw + int(cx // CELL), set()).add(_true_name(s, table, names))
         rects = []
         for s in sorted(truth, key=lambda s: s["draw_depth"]):
             x0, y0, x1, y1 = s["box"]
             rects.append(f'<rect class="t" x="{x0}" y="{y0}" width="{x1 - x0}" height="{y1 - y0}">'
-                         f"<title>{html.escape(s['name'])}</title></rect>")
+                         f"<title>{html.escape(_true_name(s, table, names))} ({html.escape(s['name'])})</title></rect>")
         for g in found:
             x0, y0, x1, y1 = g.box
             cell = int(((y0 + y1) / 2) // CELL) * gw + int(((x0 + x1) / 2) // CELL)
@@ -198,12 +205,13 @@ def _guess_tile(model: DetectModel, shot: np.ndarray, dev, cv2) -> float:
 
 
 def live(folder: Path, region: tuple[int, int, int, int] | None, tile_px: float | None,
-         threshold: float = 0.5, device: str = "auto", fps: float = 10, labels: bool = True) -> None:
+         threshold: float = 0.5, device: str = "auto", fps: float = 10, labels: bool = True,
+         name_threshold: float = 0.6) -> None:
     """Capture region (left, top, width, height in screen points; None: drag a
     box) of the game view, where one game tile is tile_px captured pixels
     (None: worked out from the first picture), and show the model's boxes and
-    names in a window. Press q in the window to stop. Nothing is sent to the
-    game."""
+    names in a window; a name the model is less sure of than name_threshold
+    shows as "?". Press q in the window to stop. Nothing is sent to the game."""
     try:
         import cv2
         import mss
@@ -238,7 +246,8 @@ def live(folder: Path, region: tuple[int, int, int, int] | None, tile_px: float 
                 x0, y0, x1, y1 = (int(v * show) for v in g.box)
                 cv2.rectangle(view, (x0, y0), (x1, y1), (0, 200, 255), 1)
                 if labels:
-                    cv2.putText(view, g.name[:18], (x0, max(10, y0 - 2)), cv2.FONT_HERSHEY_SIMPLEX, 0.35,
+                    label = g.name[:18] if g.names[0][1] >= name_threshold else "?"
+                    cv2.putText(view, label, (x0, max(10, y0 - 2)), cv2.FONT_HERSHEY_SIMPLEX, 0.35,
                                 (255, 255, 255), 1, cv2.LINE_AA)
             cv2.putText(view, f"{len(found)} things, model {ms:.0f} ms", (6, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                         (0, 255, 0), 1, cv2.LINE_AA)
