@@ -21,6 +21,10 @@ train = [
     "safetensors>=0.4",
     "schedulefree>=1.4",
 ]
+live = [
+    "mss>=9.0",
+    "opencv-python>=4.9",
+]
 text = [
     "sentence-transformers>=3.0",
 ]

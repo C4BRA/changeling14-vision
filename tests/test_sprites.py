@@ -310,3 +310,12 @@ def test_detect_trains_from_a_stage1_model(tmp_path):
     # Resuming continues from the saved step.
     opts.steps = 4
     assert train_detect(opts)["step"] == 4
+
+
+def test_predict_report_from_a_replay_model(tmp_path):
+    from changeling14_vision.replays.predict import predict_report
+
+    test_detect_trains_from_a_stage1_model(tmp_path)
+    page = predict_report(tmp_path / "det", tmp_path / "ds", device="cpu", threshold=0.0)
+    text = page.read_text()
+    assert "held-out frames" in text and "<figure>" in text
