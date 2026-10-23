@@ -19,6 +19,8 @@ from .progress import Progress
 DEFAULT_REPO = "~/Desktop/SS13-14/wizden-ss14"
 DEFAULT_OUT = "~/Desktop/SS13-14/ss14-sprite-dataset"
 DEFAULT_MODELS = "~/Desktop/SS13-14/changeling14-models"
+DEFAULT_INBOX = "~/Desktop/SS13-14/replay-inbox"
+DEFAULT_LIBRARY = "~/Desktop/SS13-14/replay-library"
 TRAIN_DEPS = 'the training steps need PyTorch: pip install -e ".[train]"'
 
 
@@ -152,6 +154,34 @@ def cmd_export(args) -> int:
     return 0 if not result["failed"] else 1
 
 
+def cmd_replays_import(args) -> int:
+    from .replays.importer import import_replays
+
+    progress = Progress(args.run_dir)
+    progress.catch_stop()
+    result = import_replays(Path(args.inbox), Path(args.library), args.remove_from_inbox, progress)
+    for row in result.imported:
+        length = f", length {row['duration']}" if row.get("duration") else ""
+        print(f"imported {row['original']}: build {row['build']}{length} -> {row['file']}", flush=True)
+    for name, reason in result.skipped:
+        print(f"skipped {name}: {reason}", flush=True)
+    print(f"replays: {len(result.imported)} imported, {len(result.skipped)} skipped, "
+          f"library {Path(args.library).expanduser()}", flush=True)
+    return 0
+
+
+def cmd_replays_list(args) -> int:
+    from collections import Counter
+
+    from .replays.importer import load_library
+
+    rows = load_library(Path(args.library).expanduser())
+    for build, n in sorted(Counter(r["build"] for r in rows).items()):
+        print(f"{build}: {n} replay(s)")
+    print(f"{len(rows)} replay(s) in {Path(args.library).expanduser()}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="changeling14-vision")
     parser.add_argument("--run-dir", help="report progress here (default: $C14_RUN_DIR)")
@@ -224,6 +254,18 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--height", type=int, default=480, help="frame height for fixed-size formats (default 480)")
     p.add_argument("--width", type=int, default=480, help="frame width for fixed-size formats (default 480)")
     p.set_defaults(func=cmd_export)
+
+    p = sub.add_parser("replays", help="replays: import into the library, list it")
+    rsub = p.add_subparsers(dest="replays_command", required=True)
+    r = rsub.add_parser("import", help="copy replay .zip files from the inbox into the library, by build")
+    r.add_argument("--inbox", default=DEFAULT_INBOX, help=f"folder of replay .zip files (default {DEFAULT_INBOX})")
+    r.add_argument("--library", default=DEFAULT_LIBRARY, help=f"replay library (default {DEFAULT_LIBRARY})")
+    r.add_argument("--remove-from-inbox", action="store_true",
+                   help="delete each replay from the inbox once it is safely copied (default: keep it)")
+    r.set_defaults(func=cmd_replays_import)
+    r = rsub.add_parser("list", help="replays in the library, grouped by the build that plays them")
+    r.add_argument("--library", default=DEFAULT_LIBRARY, help=f"replay library (default {DEFAULT_LIBRARY})")
+    r.set_defaults(func=cmd_replays_list)
 
     args = parser.parse_args(argv)
     return args.func(args)

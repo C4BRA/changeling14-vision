@@ -204,3 +204,32 @@ def test_stop_request_leaves_partial_report(repo, tmp_path):
 ])
 def test_license_policy(value, reason):
     assert licenses.exclusion_reason(value) == reason
+
+
+def test_replay_import_files_by_build_and_keeps_the_inbox(tmp_path):
+    import zipfile
+    from changeling14_vision.cli import main
+    from changeling14_vision.replays.importer import load_library
+    inbox, library = tmp_path / "inbox", tmp_path / "library"
+    inbox.mkdir()
+
+    def replay(name, final=True, **meta):
+        with zipfile.ZipFile(inbox / name, "w") as z:
+            z.writestr("_replay/replay.yml", "\n".join(f"{k}: {v}" for k, v in meta.items()))
+            if final:
+                z.writestr("_replay/replay_final.yml", "duration: 3600.5\nendTick: 108000\n")
+            z.writestr("_replay/data_0.dat", b"x" * 10)
+
+    meta = dict(engineVersion="267.1.0", buildForkId="wizards", buildForkVersion="c1384c6f0123456789abcdef")
+    replay("round1.zip", **meta)
+    replay("round2.zip", **{**meta, "buildForkVersion": "deadbeef0123456789"})
+    replay("broken.zip", final=False, **meta)
+    (inbox / "notes.zip").write_bytes(b"not a zip")
+    assert main(["replays", "import", "--inbox", str(inbox), "--library", str(library)]) == 0
+    rows = load_library(library)
+    assert sorted(r["build"] for r in rows) == ["wizards-c1384c6f0123", "wizards-deadbeef0123"]
+    assert (library / rows[0]["file"]).is_file() and rows[0]["endTick"] == 108000
+    assert sorted(p.name for p in inbox.iterdir()) == ["broken.zip", "notes.zip", "round1.zip", "round2.zip"]
+    # Importing again adds nothing.
+    assert main(["replays", "import", "--inbox", str(inbox), "--library", str(library)]) == 0
+    assert len(load_library(library)) == 2
