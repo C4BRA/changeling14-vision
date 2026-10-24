@@ -50,7 +50,9 @@ class FloorWriter:
         px, py = (px + 0.5) * CELL * k, (py + 0.5) * CELL * k
         names = key.get("tile_names", [])
         gas_names = key.get("gas_names", [])
-        for g in key.get("grids", []):
+        # Where grids overlap (a station built on an asteroid's sand, a docked
+        # shuttle), the smaller grid is the one on top, so it goes first.
+        for g in sorted(key.get("grids", []), key=lambda g: len(g.get("tiles") or ())):
             if not g.get("tiles"):
                 continue
             m11, m12, m21, m22, m31, m32 = g["m"]

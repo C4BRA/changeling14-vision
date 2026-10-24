@@ -352,6 +352,11 @@ class DetectModel(nn.Module):
         self.tile = nn.Linear(EMBED_DIM, n_tiles) if n_tiles else None
         self.gas = nn.Linear(EMBED_DIM, n_gas) if n_gas else None
         self.decal = nn.Linear(EMBED_DIM, n_decals) if n_decals else None
+        # Rare answers start rare, so a fresh head doesn't swamp the others' losses
+        # (178 decal kinds at even odds would add about 120 to the loss).
+        for head, prior in ((self.more, 0.1), (self.gas, 0.02), (self.decal, 0.005)):
+            if head is not None:
+                nn.init.constant_(head.bias, math.log(prior / (1 - prior)))
         self.scale = nn.Parameter(torch.tensor(math.log(10.0)))
         self.bias = nn.Parameter(torch.tensor(-10.0))
         self.register_buffer("text_vectors", torch.zeros(0, text_dim), persistent=False)

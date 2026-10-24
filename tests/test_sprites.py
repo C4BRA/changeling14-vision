@@ -525,3 +525,15 @@ def test_floor_mobs_boxes_and_zoom(tmp_path):
     assert train_detect(opts)["step"] == 4                              # resumes with the same heads
     page = predict_report(tmp_path / "det", tmp_path / "ds", device="cpu", threshold=0.0).read_text()
     assert "Floor tiles" in page
+
+
+def test_smaller_grid_wins_where_grids_overlap():
+    from changeling14_vision.replays.floor import FloorWriter
+
+    sand = {"m": [1 / 32, 0, 0, 1 / 32, 0, 0], "tiles": [[x, y, 0] for x in range(4) for y in range(4)]}
+    station = {"m": [1 / 32, 0, 0, 1 / 32, 0, 0], "tiles": [[1, 1, 1]]}
+    w = FloorWriter()
+    w.add_maps({"tile_names": ["FloorAsteroidSand", "FloorSteel"], "grids": [sand, station]}, 1, 128, 128)
+    names = list(w.tile_index)
+    tiles = w.tiles[0].reshape(16, 16)
+    assert names[tiles[5, 5]] == "FloorSteel" and names[tiles[1, 1]] == "FloorAsteroidSand"
