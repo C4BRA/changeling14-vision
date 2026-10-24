@@ -387,6 +387,7 @@ def evaluate(model: DetectModel, loader, device, stop=lambda: False, trained: to
         "macro_names": int(big.sum()),
         "name_set_precision": ratio(c["stp"], c["stp"] + c["sfp"]),
         "name_set_recall": ratio(c["stp"], c["stp"] + c["sfn"]),
+        "name_set_guesses": c["stp"] + c["sfp"],
         "something_precision": ratio(c["tp"], c["tp"] + c["fp"]),
         "something_recall": ratio(c["tp"], c["tp"] + c["fn"]),
         "player_precision": ratio(c["ptp"], c["ptp"] + c["pfp"]),
@@ -537,7 +538,8 @@ def train_detect(opts: DetectOptions, progress: Progress | None = None) -> dict:
                   f"{scores['seen_top5']:.1%}, never showed {scores['unseen_top5']:.1%} "
                   f"({scores['unseen_sprites']:,} sprites); per name {scores['macro_top5']:.1%} "
                   f"({scores['macro_names']:,} names); name sets {scores['name_set_precision']:.1%} precise, "
-                  f"{scores['name_set_recall']:.1%} found; something {scores['something_precision']:.1%} "
+                  f"{scores['name_set_recall']:.1%} found ({scores['name_set_guesses']:,} names scored 0.5 "
+                  f"or more); something {scores['something_precision']:.1%} "
                   f"precise, {scores['something_recall']:.1%} found; other players "
                   f"{scores['player_precision']:.1%} precise, {scores['player_recall']:.1%} found; "
                   f"box overlap {scores['box_iou']:.2f}", flush=True)
