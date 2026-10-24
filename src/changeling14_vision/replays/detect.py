@@ -62,7 +62,8 @@ from torch import nn
 from .. import __version__
 from ..model.encoder import EMBED_DIM, Encoder
 from ..pretrain.text import TextTable
-from ..pretrain.train import WeightAverage, load_checkpoint, pick_device, prune_checkpoints
+from ..pretrain.train import (WeightAverage, _ignore_stop_signals, load_checkpoint, pick_device,
+                              prune_checkpoints)
 from ..progress import Progress
 from .floor import CELL as FLOOR_CELL
 from .floor import DECAL_BITS, Floor
@@ -758,6 +759,9 @@ def train_detect(opts: DetectOptions, progress: Progress | None = None) -> dict:
           f"{len(vocab['decal_names']):,} decals, on {device}", flush=True)
     loader = torch.utils.data.DataLoader(train_ds, batch_size=opts.batch, shuffle=True, drop_last=True,
                                          num_workers=opts.workers, collate_fn=collate,
+                                         # The app stops a job by signalling its whole process
+                                         # group; workers must outlive that so the model is saved.
+                                         worker_init_fn=_ignore_stop_signals,
                                          persistent_workers=opts.workers > 0)
     # One whole frame at a time: held-out frames needn't all be the same size.
     test_loader = torch.utils.data.DataLoader(test_ds, batch_size=1, collate_fn=collate, num_workers=0)
@@ -792,9 +796,13 @@ def train_detect(opts: DetectOptions, progress: Progress | None = None) -> dict:
             indent=2))
 
     def save(final: bool = False) -> dict:
-        progress.update("evaluate", step, opts.steps, "held-out round", force=True)
+        # On a stop request, save straight away: the app kills the job after about 15 s,
+        # and scoring the held-out round takes longer than that.
+        stopping = progress.stop_requested
+        if not stopping:
+            progress.update("evaluate", step, opts.steps, "held-out round", force=True)
         scores = evaluate(average.model, test_loader, device, lambda: progress.stop_requested, trained) \
-            if len(test_ds) else {}
+            if len(test_ds) and not stopping else {}
         state = {"model": model.state_dict(), "optim": optim.state_dict(), "step": step,
                  "ema": average.model.state_dict(), "ema_updates": average.updates,
                  "encoder_config": model.encoder.config, "text_dim": table.dim, "start": str(start),
@@ -804,7 +812,7 @@ def train_detect(opts: DetectOptions, progress: Progress | None = None) -> dict:
         _save(latest, state)
         _save(out / "checkpoints" / f"step-{step}.pt", {k: v for k, v in state.items() if k != "optim"})
         row = {"step": step, "time": round(time.time() - started), **{k: round(v, 4) for k, v in last.items()},
-               "dataset_hash": data_hash, **scores}
+               "dataset_hash": data_hash, **({"reason": "stop"} if stopping else {}), **scores}
         with open(out / "metrics.jsonl", "a", encoding="utf-8") as f:
             f.write(json.dumps(row) + "\n")
         prune_checkpoints(out / "checkpoints", opts.keep_checkpoints, "name_top5", out / "metrics.jsonl")
@@ -822,12 +830,13 @@ def train_detect(opts: DetectOptions, progress: Progress | None = None) -> dict:
     if step == 0 and len(test_ds):
         # What the stage-1 model already gets right, before any replay training.
         row = save()
-    while step < opts.steps and not progress.stop_requested:
+    timed_out = False
+    while step < opts.steps and not progress.stop_requested and not timed_out:
         for b in loader:
             if step >= opts.steps or progress.stop_requested:
                 break
             if opts.minutes and time.time() - started > opts.minutes * 60:
-                progress.stop_requested = True
+                timed_out = True        # a planned end: the last checkpoint is still scored
                 break
             f = min(1.0, (step + 1) / opts.warmup)
             t = min(1.0, step / max(1, opts.steps))

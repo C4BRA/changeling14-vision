@@ -537,3 +537,34 @@ def test_smaller_grid_wins_where_grids_overlap():
     names = list(w.tile_index)
     tiles = w.tiles[0].reshape(16, 16)
     assert names[tiles[5, 5]] == "FloorSteel" and names[tiles[1, 1]] == "FloorAsteroidSand"
+
+
+def test_detect_stop_saves_without_scoring_and_workers_survive_the_signal(tmp_path):
+    import multiprocessing
+    import os
+    import signal
+    import threading
+
+    import torch
+
+    from changeling14_vision.progress import Progress
+    from changeling14_vision.replays.detect import DetectOptions, train_detect
+
+    test_detect_trains_from_a_stage1_model(tmp_path)
+    progress = Progress(None)
+    progress.catch_stop()
+    try:
+        opts = DetectOptions(dataset=tmp_path / "ds", start=tmp_path / "stage1", out=tmp_path / "det", steps=10_000,
+                             batch=2, workers=1, device="cpu", checkpoint_every=10_000, warmup=1)
+        # The app signals the whole process group: the loader workers as well as the main process.
+        def stop():
+            for child in multiprocessing.active_children():
+                os.kill(child.pid, signal.SIGTERM)
+            os.kill(os.getpid(), signal.SIGTERM)
+        threading.Timer(8.0, stop).start()
+        row = train_detect(opts, progress)
+    finally:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+    assert progress.stop_requested and row["reason"] == "stop" and "name_top1" not in row
+    assert torch.load(tmp_path / "det" / "latest.pt", weights_only=False)["step"] == row["step"] > 4

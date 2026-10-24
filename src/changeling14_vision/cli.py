@@ -270,6 +270,9 @@ def cmd_replays_train(args) -> int:
     progress = Progress(args.run_dir)
     progress.catch_stop()
     row = train_detect(opts, progress)
+    if progress.stop_requested:
+        print(f"detect: stopped at step {row.get('step', 0):,}; saved, run again to resume -> {opts.out}", flush=True)
+        return 143
     print(f"detect: done at step {row.get('step', 0):,} -> {opts.out}", flush=True)
     return 0
 
