@@ -291,7 +291,7 @@ public sealed partial class C14RecorderSystem : EntitySystem
         var entities = Describe(job, eye, subject, worldToPicture);
         Matrix3x2.Invert(worldToPicture, out var pictureToWorld);
         var pictureSize = viewport.Size;
-        var floor = DescribeFloor(job, eye, subject, worldToPicture, pictureToWorld, pictureSize.X, pictureSize.Y);
+        var floor = DescribeFloor(job, eye, subject, worldToPicture, pictureToWorld, (int) pictureSize.X, (int) pictureSize.Y);
         var name = $"{_moment:D5}-{subject.Id}";
         var tick = replay.CurTick.Value;
         var time = replay.CurrentReplayTime.TotalSeconds;
@@ -472,7 +472,9 @@ public sealed partial class C14RecorderSystem : EntitySystem
 
                 if (gas == null || !gas.Chunks.TryGetValue(SharedGasTileOverlaySystem.GetGasChunkIndices(at), out var chunk))
                     continue;
-                var data = chunk.TileData[chunk.GetDataIndex(at)];
+                // GasOverlayChunk.GetDataIndex, which content outside the gas systems may not call.
+                var size = SharedGasTileOverlaySystem.ChunkSize;
+                var data = chunk.TileData[(at.X - chunk.Origin.X) + (at.Y - chunk.Origin.Y) * size];
                 if (data.Opacity != null)
                 {
                     for (var g = 0; g < data.Opacity.Length && g < gasNames.Count - 1; g++)
