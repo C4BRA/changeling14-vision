@@ -304,6 +304,15 @@ def cmd_replays_live(args) -> int:
     return 0
 
 
+def cmd_replays_overlay(args) -> int:
+    from .replays.overlay import run
+
+    names = tuple(n.strip() for n in args.window_name.split(",") if n.strip()) if args.window_name else None
+    run(_replay_model(args), names, args.tile_px, args.threshold, args.name_threshold, not args.no_labels,
+        args.floor, args.pick, args.fps, args.device)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="changeling14-vision")
     parser.add_argument("--run-dir", help="report progress here (default: $C14_RUN_DIR)")
@@ -453,6 +462,23 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--floor", action="store_true", help="also show each square's floor tile and tint gas")
     r.add_argument("--device", default="auto", help="auto, mps, cuda or cpu (default auto)")
     r.set_defaults(func=cmd_replays_live)
+    r = rsub.add_parser("overlay", help="draw a replay model's boxes and names on top of the SS14 client window (macOS)")
+    r.add_argument("model", help="replay model folder name (inside --models) or path")
+    r.add_argument("--models", default=DEFAULT_MODELS, help=f"models folder (default {DEFAULT_MODELS})")
+    r.add_argument("--window-name", help="comma-separated owner or title names of the game window "
+                                         "(default: Space Station 14, Content.Client, Robust.Client, SS14.Loader)")
+    r.add_argument("--pick", action="store_true",
+                   help="drag a box around the game view first (default: the box saved in ~/.changeling14/overlay.json, "
+                        "else the whole window)")
+    r.add_argument("--tile-px", type=float, help="captured pixels per game tile (default: worked out)")
+    r.add_argument("--threshold", type=float, default=0.5, help="how sure a square must be to count (default 0.5)")
+    r.add_argument("--name-threshold", type=float, default=0.6,
+                   help='show "?" instead of a name the model is less sure of (default 0.6)')
+    r.add_argument("--fps", type=float, default=15, help="pictures per second at most (default 15)")
+    r.add_argument("--no-labels", action="store_true", help="boxes only")
+    r.add_argument("--floor", action="store_true", help="also show each square's floor tile and tint gas")
+    r.add_argument("--device", default="auto", help="auto, mps, cuda or cpu (default auto)")
+    r.set_defaults(func=cmd_replays_overlay)
 
     args = parser.parse_args(argv)
     return args.func(args)
