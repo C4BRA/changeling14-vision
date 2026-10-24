@@ -436,8 +436,16 @@ public sealed partial class C14RecorderSystem : EntitySystem
         var decalNames = new List<string>();
         var decalIndex = new Dictionary<string, int>();
 
-        var corners = new[] { new Vector2(0, 0), new Vector2(width, 0), new Vector2(0, height), new Vector2(width, height) }
-            .Select(c => Vector2.Transform(c, pictureToWorld)).ToArray();
+        // Everything within reach of the eye: the viewport's own size isn't always
+        // the picture's (it can be in other pixels), so tiles and decals outside the
+        // picture are left for the dataset step to drop.
+        var reach = Math.Max(job.VisionRange, 16f * eye.Zoom.X) + 2f;
+        var centre = eyeMap.Position;
+        var corners = new[]
+        {
+            centre + new Vector2(-reach, -reach), centre + new Vector2(reach, -reach),
+            centre + new Vector2(-reach, reach), centre + new Vector2(reach, reach),
+        };
 
         var grids = new StringBuilder();
         var decals = new StringBuilder();
@@ -519,9 +527,9 @@ public sealed partial class C14RecorderSystem : EntitySystem
                     .Select(v => Vector2.Transform(v, localToPicture)).ToArray();
                 var min = new Vector2(pts.Min(v => v.X), pts.Min(v => v.Y));
                 var max = new Vector2(pts.Max(v => v.X), pts.Max(v => v.Y));
-                if (max.X < 0 || max.Y < 0 || min.X > width || min.Y > height)
-                    continue;
                 var centreWorld = Vector2.Transform(c + new Vector2(0.5f, 0.5f), localToWorld);
+                if ((centreWorld - centre).Length() > reach)
+                    continue;
                 var blocked = !_examine.InRangeUnOccluded(eyeMap, new MapCoordinates(centreWorld, eyeMap.MapId),
                     job.VisionRange, e => e == subject);
                 if (!decalIndex.TryGetValue(decal.Id, out var d))
@@ -541,7 +549,8 @@ public sealed partial class C14RecorderSystem : EntitySystem
         }
 
         var sb = new StringBuilder();
-        sb.Append("\"tile_names\":[").Append(string.Join(",", tileNames.Select(Str))).Append(']');
+        sb.Append("\"view_size\":[").Append(width).Append(',').Append(height).Append(']');
+        sb.Append(",\"tile_names\":[").Append(string.Join(",", tileNames.Select(Str))).Append(']');
         sb.Append(",\"gas_names\":[").Append(string.Join(",", gasNames.Select(Str))).Append(']');
         sb.Append(",\"decal_names\":[").Append(string.Join(",", decalNames.Select(Str))).Append(']');
         sb.Append(",\"grids\":[").Append(grids).Append(']');
