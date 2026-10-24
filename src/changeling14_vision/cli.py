@@ -297,7 +297,7 @@ def cmd_replays_live(args) -> int:
         print("--region is left,top,width,height", flush=True)
         return 1
     live(_replay_model(args), region, args.tile_px, args.threshold, args.device, args.fps, not args.no_labels,
-         args.name_threshold)
+         args.name_threshold, args.floor)
     return 0
 
 
@@ -447,6 +447,7 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--name-threshold", type=float, default=0.6,
                    help='show "?" instead of a name the model is less sure of (default 0.6)')
     r.add_argument("--no-labels", action="store_true", help="boxes only")
+    r.add_argument("--floor", action="store_true", help="also show each square's floor tile and tint gas")
     r.add_argument("--device", default="auto", help="auto, mps, cuda or cpu (default auto)")
     r.set_defaults(func=cmd_replays_live)
 

@@ -9,6 +9,7 @@ first..first+count of sprites.npz:
   origin              where the entity stands (float32)
   depth               draw depth (int16)
   flags               bits, see FLAGS (uint8)
+  mob                 MOB_CLASSES index (uint8; 0 for anything that isn't a mob)
 
 That is about 40 bytes a sprite instead of about 300 in JSON, and the frame
 list stays small enough to read quickly. Version 1 datasets (sprites inside
@@ -25,6 +26,7 @@ import numpy as np
 
 FLAGS = ("visible", "dark", "blocked", "faint", "humanoid", "alive", "subject")
 BIT = {name: 1 << i for i, name in enumerate(FLAGS)}
+MOB_CLASSES = ("none", "humanoid", "borg", "animal", "hostile")
 
 # Groups that scores are split by, from the draw depths in
 # Content.Shared/DrawDepth/DrawDepth.cs (Objects = 0).
@@ -58,7 +60,7 @@ def group_of(depth: int, flags: int) -> int:
 class Labels:
     """All sprites of a dataset, with each frame's rows."""
 
-    def __init__(self, prototypes, names, proto, name, box, origin, depth, flags):
+    def __init__(self, prototypes, names, proto, name, box, origin, depth, flags, mob=None):
         self.prototypes = [str(p) for p in prototypes]
         self.names = [str(n) for n in names]
         self.proto = np.asarray(proto, np.int32)
@@ -67,6 +69,9 @@ class Labels:
         self.origin = np.asarray(origin, np.float32).reshape(-1, 2)
         self.depth = np.asarray(depth, np.int16)
         self.flags = np.asarray(flags, np.uint8)
+        # Datasets from before mob classes only know humanoids.
+        self.mob = np.asarray(mob, np.uint8) if mob is not None else \
+            np.where((self.flags & BIT["humanoid"]) != 0, 1, 0).astype(np.uint8)
 
     def __len__(self):
         return len(self.proto)
@@ -86,13 +91,14 @@ class Labels:
                  "center": [round((box[0] + box[2]) / 2, 1), round((box[1] + box[3]) / 2, 1)],
                  "origin": [round(float(v), 1) for v in self.origin[i]], "draw_depth": int(self.depth[i])}
             d.update({f: bool(self.flags[i] & BIT[f]) for f in FLAGS})
+            d["mob_class"] = MOB_CLASSES[self.mob[i]]
             out.append(d)
         return out
 
     def save(self, path: Path) -> None:
         tmp = path.with_name(path.name + ".tmp.npz")
         np.savez(tmp, prototypes=np.array(self.prototypes), names=np.array(self.names), proto=self.proto,
-                 name=self.name, box=self.box, origin=self.origin, depth=self.depth, flags=self.flags)
+                 name=self.name, box=self.box, origin=self.origin, depth=self.depth, flags=self.flags, mob=self.mob)
         tmp.replace(path)
 
     @classmethod
@@ -122,11 +128,13 @@ class LabelWriter:
             np.array([s.get("origin") or [(s["box"][0] + s["box"][2]) / 2, (s["box"][1] + s["box"][3]) / 2]
                       for s in sprites], np.float32).reshape(-1, 2),
             np.array([s["draw_depth"] for s in sprites], np.int16),
-            np.array([sum(BIT[f] for f in FLAGS if s.get(f)) for s in sprites], np.uint8)))
+            np.array([sum(BIT[f] for f in FLAGS if s.get(f)) for s in sprites], np.uint8),
+            np.array([MOB_CLASSES.index(s["mob_class"]) if s.get("mob_class") else int(bool(s.get("humanoid")))
+                      for s in sprites], np.uint8)))
         return first, len(sprites)
 
     def labels(self) -> Labels:
-        cols = [np.concatenate([p[i] for p in self.parts]) if self.parts else np.zeros((0,)) for i in range(6)]
+        cols = [np.concatenate([p[i] for p in self.parts]) if self.parts else np.zeros((0,)) for i in range(7)]
         return Labels(list(self.protos), list(self.names), *cols)
 
 
@@ -137,7 +145,7 @@ def load(dataset: Path) -> tuple[dict, Labels]:
     if data.get("version", 1) >= 2:
         z = np.load(dataset / "sprites.npz")
         labels = Labels(z["prototypes"], z["names"], z["proto"], z["name"], z["box"], z["origin"], z["depth"],
-                        z["flags"])
+                        z["flags"], z["mob"] if "mob" in z else None)
         return data, labels
     labels, ranges = Labels.from_sprites([f.pop("sprites") for f in data["frames"]])
     for f, (first, count) in zip(data["frames"], ranges):
@@ -148,7 +156,7 @@ def load(dataset: Path) -> tuple[dict, Labels]:
 def dataset_hash(dataset: Path) -> str:
     """Fingerprint of a dataset's frame list and sprites, saved with each model."""
     h = hashlib.sha256()
-    for name in ("dataset.json", "sprites.npz"):
+    for name in ("dataset.json", "sprites.npz", "floor.npz"):
         p = Path(dataset) / name
         if p.is_file():
             with open(p, "rb") as f:

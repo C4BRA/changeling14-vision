@@ -22,8 +22,9 @@ import torch
 from ..model.encoder import Encoder
 from ..pretrain.text import TextTable
 from ..pretrain.train import load_checkpoint, pick_device
-from .detect import CELL, DetectModel, Frames, collate
-from .labels import load
+from .detect import CELL, DetectModel, Frames, collate, load_matching
+from .floor import Floor
+from .labels import MOB_CLASSES, load
 
 
 @dataclass
@@ -33,6 +34,15 @@ class Guess:
     score: float                                # how sure that something is there, 0..1
     names: list[tuple[str, float]]              # top names with their match scores
     player: float = 0.0                         # how sure that a player stands here, 0..1
+    mob: str = "none"                           # the square's mob class (labels.MOB_CLASSES), first slot only
+    slot: int = 0                               # 0 for the topmost sprite of its square, then 1, 2, ...
+
+
+@dataclass
+class FloorGuess:
+    tiles: list[list[str]]                      # floor tile per square, rows of the frame
+    gas: dict[tuple[int, int], list[str]]       # (row, column) -> gases there
+    decals: dict[tuple[int, int], list[str]]    # (row, column) -> decals centred there
 
 
 def load_detect_model(folder: Path, device: str = "auto") -> tuple[DetectModel, TextTable, torch.device]:
@@ -41,9 +51,10 @@ def load_detect_model(folder: Path, device: str = "auto") -> tuple[DetectModel, 
     if ckpt.get("kind") != "detect":
         raise SystemExit(f"{folder} is not a replay-trained model (train one with 'replays train')")
     table = TextTable(folder / "text.npz")
-    model = DetectModel(Encoder(**{k: v for k, v in ckpt["encoder_config"].items() if k != "tile"}), table.dim)
+    model = DetectModel(Encoder(**{k: v for k, v in ckpt["encoder_config"].items() if k != "tile"}), table.dim,
+                        ckpt.get("vocab"), ckpt.get("slots", 1))
     # The weight average is what was scored; models from before it have none.
-    model.load_state_dict(ckpt.get("ema") or ckpt["model"], strict=False)
+    load_matching(model, ckpt.get("ema") or ckpt["model"])
     dev = pick_device(device)
     model.to(dev).eval()
     model.set_text(table)
@@ -56,31 +67,63 @@ def _names(table: TextTable) -> list[str]:
 
 @torch.no_grad()
 def guesses(model: DetectModel, names: list[str], image: torch.Tensor, threshold: float = 0.5,
-            top: int = 3, all_t: torch.Tensor | None = None) -> list[list[Guess]]:
-    """image (B, 3, H, W) in [0, 1] at 32 px per tile, H and W multiples of 32."""
-    out = model(image)
+            top: int = 3, all_t: torch.Tensor | None = None, out: dict | None = None) -> list[list[Guess]]:
+    """image (B, 3, H, W) in [0, 1] at 32 px per tile, H and W multiples of 32.
+    A square's first box shows when "something" passes threshold, each further
+    one when "more" does too."""
+    out = model(image) if out is None else out
     gh, gw = out["grid"]
-    b = image.shape[0]
+    b, cells, k = image.shape[0], gh * gw, model.slots
     all_t = model.texts() if all_t is None else all_t
-    p = torch.sigmoid(out["something"]).view(b, gh * gw)
-    pl = torch.sigmoid(out["player"]).view(b, gh * gw).cpu()
-    sims = out["names"] @ all_t.T * model.scale.exp() + model.bias
-    best = torch.sigmoid(sims).topk(top, dim=1)
-    vals, rows = best.values.view(b, gh * gw, top).cpu(), best.indices.view(b, gh * gw, top).cpu()
-    box = out["box"].view(b, gh * gw, 4).cpu()
-    p = p.cpu()
+    p = torch.sigmoid(out["something"]).view(b, cells).cpu()
+    more = torch.sigmoid(out["more"]).view(b, cells, k - 1).cpu()
+    pl = torch.sigmoid(out["player"]).view(b, cells).cpu()
+    mob = out["mob"].argmax(1).view(b, cells).cpu()
+    sims = torch.einsum("nke,te->nkt", out["names"], all_t) * model.scale.exp() + model.bias
+    best = torch.sigmoid(sims).topk(top, dim=2)
+    vals, rows = best.values.view(b, cells, k, top).cpu(), best.indices.view(b, cells, k, top).cpu()
+    box = out["slot_box"].view(b, cells, k, 4).cpu()
     result = []
     for i in range(b):
         found = []
         for cell in torch.nonzero(p[i] > threshold).flatten().tolist():
             cy, cx = divmod(cell, gw)
-            ox, oy, lw, lh = box[i, cell].tolist()
-            x, y = (cx + ox) * CELL, (cy + oy) * CELL
-            w, h = float(np.exp(lw)) * CELL, float(np.exp(lh)) * CELL
-            top_names = [(names[r], float(v)) for r, v in zip(rows[i, cell].tolist(), vals[i, cell].tolist())]
-            found.append(Guess((x - w / 2, y - h / 2, x + w / 2, y + h / 2), top_names[0][0],
-                               float(p[i, cell]), top_names, float(pl[i, cell])))
+            for j in range(k):
+                if j and more[i, cell, j - 1] <= threshold:
+                    break
+                ox, oy, lw, lh = box[i, cell, j].tolist()
+                x, y = (cx + ox) * CELL, (cy + oy) * CELL
+                w, h = float(np.exp(lw)) * CELL, float(np.exp(lh)) * CELL
+                top_names = [(names[r], float(v)) for r, v in zip(rows[i, cell, j].tolist(), vals[i, cell, j].tolist())]
+                sure = float(p[i, cell]) if j == 0 else float(more[i, cell, j - 1])
+                found.append(Guess((x - w / 2, y - h / 2, x + w / 2, y + h / 2), top_names[0][0], sure, top_names,
+                                   float(pl[i, cell]), MOB_CLASSES[int(mob[i, cell])] if j == 0 else "none", j))
         result.append(found)
+    return result
+
+
+@torch.no_grad()
+def floor_guesses(model: DetectModel, out: dict, threshold: float = 0.5) -> list[FloorGuess] | None:
+    """The floor tile, gases and decals the model sees in each square, or None
+    for a model without floor heads."""
+    if "tile" not in out:
+        return None
+    gh, gw = out["grid"]
+    v = model.vocab
+    tiles = out["tile"].argmax(1).view(-1, gh, gw).cpu()
+    gas = (torch.sigmoid(out["gas"]) > threshold).view(-1, gh * gw, out["gas"].shape[1]).cpu() if "gas" in out else None
+    decal = (torch.sigmoid(out["decal"]) > threshold).view(-1, gh * gw, out["decal"].shape[1]).cpu() \
+        if "decal" in out else None
+    result = []
+    for i in range(tiles.shape[0]):
+        found_gas, found_decals = {}, {}
+        for table, found, names in ((gas, found_gas, v["gas_names"]), (decal, found_decals, v["decal_names"])):
+            if table is None:
+                continue
+            for cell, j in torch.nonzero(table[i]).tolist():
+                found.setdefault(divmod(cell, gw), []).append(names[j])
+        result.append(FloorGuess([[v["tile_names"][t] for t in row] for row in tiles[i].tolist()],
+                                 found_gas, found_decals))
     return result
 
 
@@ -100,14 +143,15 @@ def predict_report(folder: Path, dataset: Path, limit: int = 60, threshold: floa
     names = _names(table)
     source = load(dataset)
     labels = source[1]
-    frames = Frames(dataset, "test", table, None, source=source)
+    frames = Frames(dataset, "test", table, None, source=source, floor=Floor.load(dataset), vocab=model.vocab)
     if not len(frames):
         raise SystemExit(f"{dataset} has no held-out frames")
     step = max(1, len(frames) // limit)
     picks = list(range(0, len(frames), step))[:limit]
     all_t = model.texts()
     confused: Counter = Counter()
-    right = wrong = 0
+    tile_confused: Counter = Counter()
+    right = wrong = tile_right = tile_seen = 0
     figs = []
     for n, i in enumerate(picks):
         if progress:
@@ -116,7 +160,27 @@ def predict_report(folder: Path, dataset: Path, limit: int = 60, threshold: floa
                 break
         f = frames.frames[i]
         item = collate([frames[i]])
-        found = guesses(model, names, item["image"].to(dev), threshold, all_t=all_t)[0]
+        with torch.no_grad():
+            out = model(item["image"].to(dev))
+        found = guesses(model, names, item["image"].to(dev), threshold, all_t=all_t, out=out)[0]
+        floor = floor_guesses(model, out, threshold)
+        floor_note = ""
+        if floor is not None:
+            truth_tiles = item["tile"].tolist()
+            gwid = len(floor[0].tiles[0])
+            here_right = here_seen = 0
+            for cell, t in enumerate(truth_tiles):
+                if t < 0:
+                    continue
+                guess_tile = floor[0].tiles[cell // gwid][cell % gwid]
+                true_tile = model.vocab["tile_names"][t]
+                here_seen += 1
+                here_right += guess_tile == true_tile
+                if guess_tile != true_tile:
+                    tile_confused[(true_tile, guess_tile)] += 1
+            tile_right += here_right
+            tile_seen += here_seen
+            floor_note = f"; floor tiles {here_right} of {here_seen} right"
         gh, gw = f["height"] // CELL, f["width"] // CELL
         truth = [s for s in labels.dicts({"first": f["dataset_first"], "count": f["count"]}) if s["visible"]]
         # Name check per square: the guessed name against the names truly centred there.
@@ -139,15 +203,21 @@ def predict_report(folder: Path, dataset: Path, limit: int = 60, threshold: floa
             if not ok and by_cell.get(cell):
                 confused[(sorted(by_cell[cell])[0], g.name)] += 1
             tip = ", ".join(f"{nm} {v:.2f}" for nm, v in g.names)
-            rects.append(f'<rect class="{"g" if ok else "x"}" x="{x0:.1f}" y="{y0:.1f}" width="{x1 - x0:.1f}" '
+            if g.mob != "none":
+                tip += f"; mob: {g.mob}"
+            rects.append(f'<rect class="{"g" if ok else "x"}{" s" if g.slot else ""}" x="{x0:.1f}" y="{y0:.1f}" width="{x1 - x0:.1f}" '
                          f'height="{y1 - y0:.1f}"><title>{html.escape(tip)} (sure {g.score:.2f})</title></rect>')
         pic = html.escape(f["picture"])
         figs.append(
             f'<figure><div class="pic" style="aspect-ratio:{f["width"]}/{f["height"]}"><img src="{pic}">'
             f'<svg viewBox="0 0 {f["width"]} {f["height"]}">{"".join(rects)}</svg></div>'
-            f"<figcaption>{pic}: {len(truth)} visible sprites, {len(found)} guesses</figcaption></figure>")
+            f"<figcaption>{pic}: {len(truth)} visible sprites, {len(found)} guesses{floor_note}</figcaption></figure>")
     rows = "".join(f"<tr><td>{html.escape(a)}</td><td>{html.escape(b)}</td><td>{c}</td></tr>"
                    for (a, b), c in confused.most_common(40))
+    tile_rows = "".join(f"<tr><td>{html.escape(a)}</td><td>{html.escape(b)}</td><td>{c}</td></tr>"
+                        for (a, b), c in tile_confused.most_common(20))
+    floor_part = (f"<h2>Floor tiles</h2><p>{tile_right} of {tile_seen} visible squares' floor named right "
+                  f"({tile_right / max(1, tile_seen):.0%}).</p><table>{tile_rows}</table>") if tile_seen else ""
     page = f"""<!doctype html><meta charset="utf-8"><title>Replay predictions</title>
 <base href="{dataset.as_uri()}/">
 <style>
@@ -155,17 +225,23 @@ body{{font:14px system-ui;background:#111;color:#ddd;margin:16px}}
 figure{{margin:0 0 24px}} .pic{{position:relative;max-width:100%;width:960px}}
 .pic img,.pic svg{{position:absolute;inset:0;width:100%;height:100%;image-rendering:pixelated}}
 rect{{fill:none;stroke-width:.8}} .t{{stroke:#3c3;stroke-dasharray:2 2}} .g{{stroke:#3af}} .x{{stroke:#f80}}
+.s{{stroke-dasharray:1 1}}
 td{{padding:2px 10px}}
 </style>
 <h1>{html.escape(folder.name)} on held-out frames</h1>
 <p>Green dashed: what is really there and visible. Blue: a guess with the right name for its square.
-Orange: a guess whose name is wrong (or nothing is centred there). Hover a box for the top names.</p>
+Orange: a guess whose name is wrong (or nothing is centred there). Dotted: a second or third sprite in
+the same square. Hover a box for the top names and mob class.</p>
 <p>{right} of {right + wrong} guesses named right ({right / max(1, right + wrong):.0%}) on {len(figs)} frames.</p>
 <h2>Most common mix-ups (really there, guessed)</h2><table>{rows}</table>
+{floor_part}
 {"".join(figs)}"""
     out = folder / "predictions.html"
     out.write_text(page, encoding="utf-8")
     return out
+
+
+MOB_COLOURS = {"humanoid": (255, 0, 255), "borg": (255, 255, 0), "animal": (0, 220, 0), "hostile": (0, 0, 255)}
 
 
 def _pick_region(screen, cv2) -> tuple[int, int, int, int]:
@@ -212,12 +288,15 @@ def _guess_tile(model: DetectModel, shot: np.ndarray, dev, cv2) -> float:
 
 def live(folder: Path, region: tuple[int, int, int, int] | None, tile_px: float | None,
          threshold: float = 0.5, device: str = "auto", fps: float = 10, labels: bool = True,
-         name_threshold: float = 0.6) -> None:
+         name_threshold: float = 0.6, show_floor: bool = False) -> None:
     """Capture region (left, top, width, height in screen points; None: drag a
     box) of the game view, where one game tile is tile_px captured pixels
     (None: worked out from the first picture), and show the model's boxes and
     names in a window; a name the model is less sure of than name_threshold
-    shows as "?". Press q in the window to stop. Nothing is sent to the game."""
+    shows as "?". Mobs are coloured by class: players magenta, borgs cyan,
+    animals green, hostile mobs red. show_floor also writes each square's
+    floor tile and tints squares with gas. Press q in the window to stop.
+    Nothing is sent to the game."""
     try:
         import cv2
         import mss
@@ -244,18 +323,33 @@ def live(folder: Path, region: tuple[int, int, int, int] | None, tile_px: float 
             last = time.time()
             frame = _to_model(np.asarray(screen.grab(box))[:, :, :3], tile_px, cv2)
             t0 = time.time()
-            found = guesses(model, names, _tensor(frame, dev), threshold, all_t=all_t)[0]
+            x = _tensor(frame, dev)
+            with torch.no_grad():
+                out = model(x)
+            found = guesses(model, names, x, threshold, all_t=all_t, out=out)[0]
+            floor = floor_guesses(model, out) if show_floor else None
             ms = (time.time() - t0) * 1000
             h32, w32 = frame.shape[:2]
             view = cv2.resize(frame, (w32 * show, h32 * show), interpolation=cv2.INTER_NEAREST)
+            if floor is not None:
+                # Gas tints its squares; each square's floor tile is written small in its corner.
+                for (r, c), gases in floor[0].gas.items():
+                    tint = view[r * CELL * show:(r + 1) * CELL * show, c * CELL * show:(c + 1) * CELL * show]
+                    tint[:] = (tint * 0.6 + np.array((200, 0, 200)) * 0.4).astype(np.uint8)
+                for r, row in enumerate(floor[0].tiles):
+                    for c, tile in enumerate(row):
+                        cv2.putText(view, tile[:10], (c * CELL * show + 2, (r + 1) * CELL * show - 3),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.25, (160, 160, 160), 1, cv2.LINE_AA)
             for g in found:
                 x0, y0, x1, y1 = (int(v * show) for v in g.box)
                 is_player = g.player >= 0.5
-                cv2.rectangle(view, (x0, y0), (x1, y1), (255, 0, 255) if is_player else (0, 200, 255),
-                              2 if is_player else 1)
+                colour = MOB_COLOURS.get(g.mob) or ((255, 0, 255) if is_player else (0, 200, 255))
+                cv2.rectangle(view, (x0, y0), (x1, y1), colour, 2 if g.mob != "none" or is_player else 1)
                 if labels:
                     label = g.name[:18] if g.names[0][1] >= name_threshold else "?"
-                    if is_player:
+                    if g.mob not in ("none", "humanoid"):
+                        label = f"{g.mob}: {label}"
+                    elif is_player:
                         label = f"player: {label}"
                     cv2.putText(view, label, (x0, max(10, y0 - 2)), cv2.FONT_HERSHEY_SIMPLEX, 0.35,
                                 (255, 255, 255), 1, cv2.LINE_AA)

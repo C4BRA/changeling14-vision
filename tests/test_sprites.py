@@ -415,3 +415,113 @@ def test_prune_checkpoints_keeps_newest_and_best(tmp_path):
     assert sorted(p.name for p in tmp_path.glob("*.pt")) == ["step-0000100.pt", "step-0000300.pt", "step-0000400.pt"]
     prune_checkpoints(tmp_path, 0, "score", tmp_path / "metrics.jsonl")      # 0 keeps all
     assert len(list(tmp_path.glob("*.pt"))) == 3
+
+
+def _floor_recording(root, zoom_too=True):
+    """A recording with grids, gas, decals, mobs, stacked sprites and a zoomed-out picture."""
+    import numpy as np
+    from PIL import Image
+
+    frames = root / "frames"
+    frames.mkdir(parents=True)
+    rng = np.random.default_rng(1)
+    shots = [(1, 2016, 1440), (1, 2016, 1440)] + ([(1.5, 2016, 1440)] if zoom_too else [])
+    for i, (zoom, w, h) in enumerate(shots):
+        a = rng.integers(60, 120, (h, w, 3), dtype=np.uint8)
+        a[:, 600 * i:600 * i + 500] += 100                    # so pictures aren't near-repeats
+        tile = 96 / zoom                                      # picture pixels per tile
+        t = int(tile)
+        a[7 * t:8 * t:6, 2 * t:3 * t] = 250                   # the decal: a striped tile
+        Image.fromarray(a).save(frames / f"{i:05d}-5.png")
+        ents = []
+        for k in range(8):                                    # a row of walls, one tile each
+            ents.append({"prototype": "WallSolid", "name": "wall", "center": [tile * k + tile / 2, tile / 2],
+                         "box": [tile * k, 0, tile * (k + 1), tile], "draw_depth": -8, "rotation": 0,
+                         "blocked": False, "alive": False, "humanoid": False, "subject": False})
+        cx, cy = tile * 5.5, tile * 5.5                       # a crowbar on a table, and a carp and a borg nearby
+        for proto, depth, extra in (("Table", 0, {}), ("Crowbar", 4, {}),
+                                    ("MobCarp", 6, {"mob": True, "factions": "SimpleHostile", "alive": True}),
+                                    ("PlayerBorgGeneric", 6, {"mob": True, "borg": True, "alive": True})):
+            dx = {"MobCarp": 2, "PlayerBorgGeneric": 4}.get(proto, 0) * tile
+            ents.append({"prototype": proto, "name": proto.lower(), "center": [cx + dx, cy],
+                         "box": [cx + dx - tile / 2, cy - tile / 2, cx + dx + tile / 2, cy + tile / 2],
+                         "draw_depth": depth, "rotation": 0, "blocked": False, "alive": False, "humanoid": False,
+                         "subject": False, **extra})
+        # One grid, picture -> grid: x / tile, and y / tile flipped (y is up in the grid), so
+        # picture tile row y is grid tile row -y - 1.
+        tiles = [[x, -y - 1, (x + y) % 2] for x in range(-1, 25) for y in range(0, 18)]
+        grid = {"uid": 3, "m": [1 / tile, 0, 0, -1 / tile, 0, 0], "tile_size": 1, "tiles": tiles,
+                "gas": [[3, -4, 0, 200], [4, -4, 1, 10]]}
+        decals = [{"id": 0, "box": [tile * 2, tile * 7, tile * 3, tile * 8], "z": 0, "blocked": False}]
+        (frames / f"{i:05d}-5.json").write_text(json.dumps(
+            {"picture": f"{i:05d}-5.png", "tick": i, "time": i * 30.0, "subject": 5, "eye_rotation": 0,
+             "zoom": zoom, "width": w, "height": h, "tile_names": ["FloorSteel", "Plating"],
+             "gas_names": ["Plasma", "Fire"], "decal_names": ["WarnLineN"], "grids": [grid], "decals": decals,
+             "entities": ents}))
+    return root
+
+
+def test_floor_mobs_boxes_and_zoom(tmp_path):
+    import numpy as np
+    import torch
+
+    from changeling14_vision.pretrain.train import build_model
+    from changeling14_vision.replays.dataset import build_dataset
+    from changeling14_vision.replays.detect import DetectOptions, Frames, train_detect
+    from changeling14_vision.replays.floor import Floor
+    from changeling14_vision.replays.labels import load
+    from changeling14_vision.replays.predict import predict_report
+
+    recs = [_floor_recording(tmp_path / "rA"), _floor_recording(tmp_path / "rB", zoom_too=False)]
+    s = build_dataset(recs, tmp_path / "ds", holdout=["rB"])
+    assert s["zoomed_frames"] == 1 and s["floor_frames"] == s["frames"] == 5 and s["scale_from_walls"] == 0
+    data, labels = load(tmp_path / "ds")
+    zoomed = [f for f in data["frames"] if f["zoom"] == 1.5][0]
+    assert (zoomed["width"], zoomed["height"]) == (1008, 720)          # 31.5 x 22.5 tiles of 32 px
+    sprites = {d["prototype"]: d for d in labels.dicts(zoomed)}
+    assert sprites["WallSolid"]["box"][2] - sprites["WallSolid"]["box"][0] == 32
+    assert sprites["MobCarp"]["mob_class"] == "hostile" and sprites["PlayerBorgGeneric"]["mob_class"] == "borg"
+    floor = Floor.load(tmp_path / "ds")
+    tiles, gas = floor.maps(zoomed)
+    # Picture tile (x, y) is FloorSteel when x + y is even; this is the 8 px map cell in the middle of (3, 3).
+    tile_33 = tiles[3 * 4 + 2, 3 * 4 + 2]
+    assert floor.tile_names[tile_33] == "FloorSteel"
+    assert gas[3 * 4 + 2, 3 * 4 + 2] == 1 and gas[3 * 4 + 2, 4 * 4 + 2] == 0     # opacity 10 is too faint
+    assert floor.decal_names == ["WarnLineN"]
+
+    class Table:
+        row_of_entity = {"WallSolid": 0, "Table": 1, "Crowbar": 2, "MobCarp": 3, "PlayerBorgGeneric": 4}
+        texts = ["wall", "table", "crowbar", "carp", "borg"]
+
+    ds = Frames(tmp_path / "ds", "train", Table, None)
+    item = ds[0]
+    gw = 672 // 32
+    cell = 5 * gw + 5
+    assert item["slot_on"][cell].tolist() == [1, 1, 0]                  # crowbar on top of the table
+    assert item["slot_pos"].tolist().count([cell, 0, 2]) == 1 and [cell, 1, 1] in item["slot_pos"].tolist()
+    assert item["mob"][cell + 2] == 4 and item["mob"][cell + 4] == 2
+    assert item["tile"][0] == -1                                        # under a wall
+    assert item["tile"][3 * gw + 3] >= 0 and item["gas"][3 * gw + 3, 0] == 1
+    assert [7 * gw + 2, 0] in item["decal_pos"].tolist()
+    # Training crops of the zoomed-out frame, and of padded ones, stay 480 x 480.
+    crops = Frames(tmp_path / "ds", "train", Table, 480, augment=True)
+    assert {tuple(crops[i]["image"].shape) for i in range(len(crops)) for _ in range(3)} == {(3, 480, 480)}
+
+    start = tmp_path / "stage1"
+    start.mkdir()
+    np.savez(start / "text.npz", texts=np.array(Table.texts),
+             vectors=np.random.default_rng(0).normal(size=(5, 8)).astype(np.float16),
+             entities=np.array(list(Table.row_of_entity)), entity_text=np.arange(5, dtype=np.int32),
+             model=np.array("test"), rich=np.array(False))
+    m = build_model("nano", {"categories": ["a"]}, text_dim=8)
+    torch.save({"model": m.state_dict(), "encoder_config": m.encoder.config, "text_dim": 8, "step": 5},
+               start / "latest.pt")
+    opts = DetectOptions(dataset=tmp_path / "ds", start=start, out=tmp_path / "det", steps=3, batch=2, workers=0,
+                         device="cpu", checkpoint_every=2, warmup=1)
+    row = train_detect(opts)
+    for key in ("tile_top1", "gas_precision", "decal_recall", "mob_recall_hostile", "second_box_recall"):
+        assert key in row, key
+    opts.steps = 4
+    assert train_detect(opts)["step"] == 4                              # resumes with the same heads
+    page = predict_report(tmp_path / "det", tmp_path / "ds", device="cpu", threshold=0.0).read_text()
+    assert "Floor tiles" in page

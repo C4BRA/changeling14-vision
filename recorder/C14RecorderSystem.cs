@@ -8,6 +8,10 @@
 // living players, saves what their screen shows (the game view only, no UI) as
 // a PNG, and writes a JSON answer key with every entity drawn in that view:
 // prototype id, name, sprite box in image pixels, and whether a wall blocks it.
+// It also writes what is on the floor: every grid in view with the floor tile
+// and visible gas of each tile, and every decal (warning stripes, markings,
+// dirt) with its box. Ghosts are hidden first, since a living player can't see
+// them.
 
 using System.Globalization;
 using System.IO;
@@ -15,12 +19,21 @@ using System.IO.Compression;
 using System.Linq;
 using System.Numerics;
 using System.Text;
+using Content.Client.Atmos.EntitySystems;
+using Content.Client.Decals;
 using Content.Client.Replay.Spectator;
 using Content.Client.Viewport;
+using Content.Shared.Atmos;
+using Content.Shared.Atmos.Components;
+using Content.Shared.Atmos.EntitySystems;
 using Content.Shared.Examine;
+using Content.Shared.Ghost.Components;
 using Content.Shared.Humanoid;
+using Content.Shared.Maps;
 using Content.Shared.Mobs.Components;
 using Content.Shared.Mobs.Systems;
+using Content.Shared.NPC.Components;
+using Content.Shared.Silicons.Borgs.Components;
 using Content.Shared.SubFloor;
 using Robust.Client;
 using Robust.Client.GameObjects;
@@ -32,6 +45,7 @@ using Robust.Shared.ContentPack;
 using Robust.Shared.Containers;
 using Robust.Shared.Graphics;
 using Robust.Shared.Map;
+using Robust.Shared.Map.Components;
 using Robust.Shared.Replays;
 using Robust.Shared.Utility;
 using SixLabors.ImageSharp;
@@ -53,6 +67,10 @@ public sealed partial class C14RecorderSystem : EntitySystem
     [Dependency] private SharedContainerSystem _containers = default!;
     [Dependency] private ExamineSystemShared _examine = default!;
     [Dependency] private MobStateSystem _mobs = default!;
+    [Dependency] private SharedMapSystem _maps = default!;
+    [Dependency] private DecalSystem _decals = default!;
+    [Dependency] private GasTileOverlaySystem _gasOverlay = default!;
+    [Dependency] private ITileDefinitionManager _tileDefs = default!;
 
     private static readonly ResPath Root = new("/c14-recorder");
     private static readonly ResPath JobFile = Root / "job.txt";
@@ -269,7 +287,11 @@ public sealed partial class C14RecorderSystem : EntitySystem
         Matrix3x2.Invert(viewport.GetLocalToScreenMatrix(), out var screenToLocal);
         var worldToPicture = viewport.GetWorldToScreenMatrix() * screenToLocal;
 
+        HideGhosts();
         var entities = Describe(job, eye, subject, worldToPicture);
+        Matrix3x2.Invert(worldToPicture, out var pictureToWorld);
+        var pictureSize = viewport.Size;
+        var floor = DescribeFloor(job, eye, subject, worldToPicture, pictureToWorld, pictureSize.X, pictureSize.Y);
         var name = $"{_moment:D5}-{subject.Id}";
         var tick = replay.CurTick.Value;
         var time = replay.CurrentReplayTime.TotalSeconds;
@@ -287,7 +309,7 @@ public sealed partial class C14RecorderSystem : EntitySystem
                 }
 
                 var json = KeyJson(name, tick, time, subject, eyeRotation, zoom,
-                    image.Width, image.Height, entities);
+                    image.Width, image.Height, entities, floor);
                 WriteText(OutDir / (name + ".json"), json);
                 _saved++;
             }
@@ -313,6 +335,20 @@ public sealed partial class C14RecorderSystem : EntitySystem
         public bool Alive;
         public bool Humanoid;
         public bool UnderFloor;
+        public bool Mob;
+        public bool Borg;
+        public string Factions = "";
+    }
+
+    // Ghosts are drawn for a replay's spectator but not for a living player.
+    private void HideGhosts()
+    {
+        var query = EntityQueryEnumerator<GhostComponent, SpriteComponent>();
+        while (query.MoveNext(out var uid, out _, out var sprite))
+        {
+            if (sprite.Visible)
+                _sprite.SetVisible((uid, sprite), false);
+        }
     }
 
     private List<Seen> Describe(Job job, IEye eye, EntityUid subject, Matrix3x2 worldToPicture)
@@ -356,6 +392,11 @@ public sealed partial class C14RecorderSystem : EntitySystem
                 Alive = TryComp<MobStateComponent>(uid, out var mob) && _mobs.IsAlive(uid, mob),
                 Humanoid = HasComp<HumanoidProfileComponent>(uid),
                 UnderFloor = TryComp<SubFloorHideComponent>(uid, out var subfloor) && subfloor.IsUnderCover,
+                Mob = HasComp<MobStateComponent>(uid),
+                Borg = HasComp<BorgChassisComponent>(uid),
+                Factions = TryComp<NpcFactionMemberComponent>(uid, out var factions)
+                    ? string.Join(",", factions.Factions.Select(f => f.ToString()))
+                    : "",
             });
         }
         return seen;
@@ -379,8 +420,135 @@ public sealed partial class C14RecorderSystem : EntitySystem
         return false;
     }
 
+    // Every grid in view: a matrix from picture pixels to the grid's own
+    // coordinates (tile x = floor(local x / tile_size)), the floor tile of each
+    // tile there, and the visible gases and fire on it. Then every decal in view.
+    private string DescribeFloor(Job job, IEye eye, EntityUid subject, Matrix3x2 worldToPicture,
+        Matrix3x2 pictureToWorld, int width, int height)
+    {
+        var eyeMap = eye.Position;
+        var tileNames = new List<string>();
+        var tileIndex = new Dictionary<string, int>();
+        var gasNames = new List<string>();
+        foreach (var id in _gasOverlay.VisibleGasId)
+            gasNames.Add(((Gas) id).ToString());
+        gasNames.Add("Fire");
+        var decalNames = new List<string>();
+        var decalIndex = new Dictionary<string, int>();
+
+        var corners = new[] { new Vector2(0, 0), new Vector2(width, 0), new Vector2(0, height), new Vector2(width, height) }
+            .Select(c => Vector2.Transform(c, pictureToWorld)).ToArray();
+
+        var grids = new StringBuilder();
+        var decals = new StringBuilder();
+        var query = EntityQueryEnumerator<MapGridComponent, TransformComponent>();
+        while (query.MoveNext(out var gridUid, out var grid, out var xform))
+        {
+            if (xform.MapID != eyeMap.MapId)
+                continue;
+            var worldToLocal = _transform.GetInvWorldMatrix(gridUid);
+            var localToWorld = _transform.GetWorldMatrix(gridUid);
+            var local = corners.Select(c => Vector2.Transform(c, worldToLocal)).ToArray();
+            var box = new Box2(local.Min(c => c.X) - 1, local.Min(c => c.Y) - 1,
+                local.Max(c => c.X) + 1, local.Max(c => c.Y) + 1);
+
+            TryComp<GasTileOverlayComponent>(gridUid, out var gas);
+            var tiles = new StringBuilder();
+            var gases = new StringBuilder();
+            var tilesEnum = _maps.GetLocalTilesIntersecting(gridUid, grid, box, true);
+            while (tilesEnum.MoveNext(out var tileRef))
+            {
+                var tileId = _tileDefs[tileRef.Tile.TypeId].ID;
+                if (!tileIndex.TryGetValue(tileId, out var t))
+                {
+                    t = tileNames.Count;
+                    tileIndex[tileId] = t;
+                    tileNames.Add(tileId);
+                }
+                var at = tileRef.GridIndices;
+                if (tiles.Length > 0)
+                    tiles.Append(',');
+                tiles.Append('[').Append(at.X).Append(',').Append(at.Y).Append(',').Append(t).Append(']');
+
+                if (gas == null || !gas.Chunks.TryGetValue(SharedGasTileOverlaySystem.GetGasChunkIndices(at), out var chunk))
+                    continue;
+                var data = chunk.TileData[chunk.GetDataIndex(at)];
+                if (data.Opacity != null)
+                {
+                    for (var g = 0; g < data.Opacity.Length && g < gasNames.Count - 1; g++)
+                    {
+                        if (data.Opacity[g] == 0)
+                            continue;
+                        if (gases.Length > 0)
+                            gases.Append(',');
+                        gases.Append('[').Append(at.X).Append(',').Append(at.Y).Append(',').Append(g).Append(',')
+                            .Append(data.Opacity[g]).Append(']');
+                    }
+                }
+                if (data.FireState != 0)
+                {
+                    if (gases.Length > 0)
+                        gases.Append(',');
+                    gases.Append('[').Append(at.X).Append(',').Append(at.Y).Append(',').Append(gasNames.Count - 1)
+                        .Append(',').Append(data.FireState).Append(']');
+                }
+            }
+            if (tiles.Length == 0)
+                continue;
+
+            var m = worldToLocal;
+            var p = pictureToWorld * m;
+            if (grids.Length > 0)
+                grids.Append(',');
+            grids.Append("{\"uid\":").Append(gridUid.Id);
+            grids.Append(",\"m\":[").Append(Num6(p.M11)).Append(',').Append(Num6(p.M12)).Append(',')
+                .Append(Num6(p.M21)).Append(',').Append(Num6(p.M22)).Append(',')
+                .Append(Num6(p.M31)).Append(',').Append(Num6(p.M32)).Append(']');
+            grids.Append(",\"tile_size\":").Append(grid.TileSize);
+            grids.Append(",\"tiles\":[").Append(tiles).Append(']');
+            grids.Append(",\"gas\":[").Append(gases).Append("]}");
+
+            // Decals sit at their bottom-left corner and cover one tile.
+            var localToPicture = localToWorld * worldToPicture;
+            foreach (var (_, decal) in _decals.GetDecalsIntersecting(gridUid, box))
+            {
+                var c = decal.Coordinates;
+                var pts = new[] { c, c + new Vector2(1, 0), c + new Vector2(0, 1), c + new Vector2(1, 1) }
+                    .Select(v => Vector2.Transform(v, localToPicture)).ToArray();
+                var min = new Vector2(pts.Min(v => v.X), pts.Min(v => v.Y));
+                var max = new Vector2(pts.Max(v => v.X), pts.Max(v => v.Y));
+                if (max.X < 0 || max.Y < 0 || min.X > width || min.Y > height)
+                    continue;
+                var centreWorld = Vector2.Transform(c + new Vector2(0.5f, 0.5f), localToWorld);
+                var blocked = !_examine.InRangeUnOccluded(eyeMap, new MapCoordinates(centreWorld, eyeMap.MapId),
+                    job.VisionRange, e => e == subject);
+                if (!decalIndex.TryGetValue(decal.Id, out var d))
+                {
+                    d = decalNames.Count;
+                    decalIndex[decal.Id] = d;
+                    decalNames.Add(decal.Id);
+                }
+                if (decals.Length > 0)
+                    decals.Append(',');
+                decals.Append("{\"id\":").Append(d);
+                decals.Append(",\"box\":[").Append(Num(min.X)).Append(',').Append(Num(min.Y)).Append(',')
+                    .Append(Num(max.X)).Append(',').Append(Num(max.Y)).Append(']');
+                decals.Append(",\"z\":").Append(decal.ZIndex);
+                decals.Append(",\"blocked\":").Append(blocked ? "true" : "false").Append('}');
+            }
+        }
+
+        var sb = new StringBuilder();
+        sb.Append("\"tile_names\":[").Append(string.Join(",", tileNames.Select(Str))).Append(']');
+        sb.Append(",\"gas_names\":[").Append(string.Join(",", gasNames.Select(Str))).Append(']');
+        sb.Append(",\"decal_names\":[").Append(string.Join(",", decalNames.Select(Str))).Append(']');
+        sb.Append(",\"grids\":[").Append(grids).Append(']');
+        sb.Append(",\"decals\":[").Append(decals).Append(']');
+        return sb.ToString();
+    }
+
     private static string KeyJson(string name, uint tick, double time, EntityUid subject,
-        double eyeRotation, float zoom, int width, int height, List<Seen> entities)
+        double eyeRotation, float zoom, int width, int height, List<Seen> entities, string floor)
     {
         var sb = new StringBuilder();
         sb.Append('{');
@@ -392,6 +560,7 @@ public sealed partial class C14RecorderSystem : EntitySystem
         sb.Append(",\"zoom\":").Append(Num(zoom));
         sb.Append(",\"width\":").Append(width);
         sb.Append(",\"height\":").Append(height);
+        sb.Append(',').Append(floor);
         sb.Append(",\"entities\":[");
         var first = true;
         foreach (var e in entities)
@@ -414,6 +583,9 @@ public sealed partial class C14RecorderSystem : EntitySystem
             sb.Append(",\"alive\":").Append(e.Alive ? "true" : "false");
             sb.Append(",\"humanoid\":").Append(e.Humanoid ? "true" : "false");
             sb.Append(",\"under_floor\":").Append(e.UnderFloor ? "true" : "false");
+            sb.Append(",\"mob\":").Append(e.Mob ? "true" : "false");
+            sb.Append(",\"borg\":").Append(e.Borg ? "true" : "false");
+            sb.Append(",\"factions\":").Append(Str(e.Factions));
             sb.Append(",\"subject\":").Append(e.Uid == subject ? "true" : "false");
             sb.Append('}');
         }
@@ -424,6 +596,11 @@ public sealed partial class C14RecorderSystem : EntitySystem
     private static string Num(double value)
     {
         return Math.Round(value, 2).ToString(CultureInfo.InvariantCulture);
+    }
+
+    private static string Num6(float value)
+    {
+        return Math.Round(value, 6).ToString(CultureInfo.InvariantCulture);
     }
 
     private static string Str(string value)
