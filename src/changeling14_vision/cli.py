@@ -309,7 +309,7 @@ def cmd_replays_overlay(args) -> int:
 
     names = tuple(n.strip() for n in args.window_name.split(",") if n.strip()) if args.window_name else None
     run(_replay_model(args), names, args.tile_px, args.threshold, args.name_threshold, not args.no_labels,
-        args.floor, args.pick, args.fps, args.device, backend=args.backend)
+        args.floor, args.pick, args.fps, args.device, backend=args.backend, view_mode=args.view)
     return 0
 
 
@@ -487,9 +487,11 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--models", default=DEFAULT_MODELS, help=f"models folder (default {DEFAULT_MODELS})")
     r.add_argument("--window-name", help="comma-separated owner or title names of the game window "
                                          "(default: Space Station 14, Content.Client, Robust.Client, SS14.Loader)")
-    r.add_argument("--pick", action="store_true",
-                   help="drag a box around the game view first (default: the box saved in ~/.changeling14/overlay.json, "
-                        "else the whole window)")
+    r.add_argument("--view", default="auto", choices=["auto", "manual"],
+                   help="auto: find the game view from the client's settings, the floor grid and the player, and "
+                        "ignore the HUD (default); manual: the box saved in ~/.changeling14/overlay.json, else the "
+                        "whole window")
+    r.add_argument("--pick", action="store_true", help="drag a box around the game view first (implies --view manual)")
     r.add_argument("--tile-px", type=float, help="captured pixels per game tile (default: worked out)")
     r.add_argument("--threshold", type=float, default=0.5, help="how sure a square must be to count (default 0.5)")
     r.add_argument("--name-threshold", type=float, default=0.6,

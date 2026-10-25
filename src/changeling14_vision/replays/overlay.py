@@ -7,15 +7,17 @@ never get in the picture, runs the model on the game-view part of it and
 draws in a transparent, click-through, always-on-top window placed exactly
 over the game view. It follows the window when it moves or resizes and hides
 while it is minimised or on another space. A small control panel pauses,
-toggles labels and floor tiles, sets the threshold, re-picks the game-view
-area and quits.
+toggles labels and floor tiles, sets the threshold, switches between the
+automatic game view and a hand-picked one, and quits.
 
 Read-only: nothing is sent to the game and the client is not modified, so it
 works with the normal launcher on any server. macOS asks for Screen Recording
 permission for the app that runs it (Terminal, usually).
 
-The game-view area is stored as fractions of the window in
-~/.changeling14/overlay.json, so it survives moves and resizes.
+The game view is found automatically by default (view.py: the client's own
+settings, the floor grid and the player); detections under the HUD are
+dropped. A hand-picked area ("manual") is stored as fractions of the window
+in ~/.changeling14/overlay.json, so it survives moves and resizes.
 """
 
 from __future__ import annotations
@@ -223,6 +225,7 @@ class Result:
     fps: float = 0.0
     note: str = ""
     view: object = None                             # the captured game view this result belongs to
+    offset: tuple[float, float] = (0.0, 0.0)        # points from the overlay's top-left to the model's first square
 
 
 def capture_window(Quartz, wid: int, rect: tuple[float, float, float, float] | None = None,
@@ -251,10 +254,12 @@ def status_line(d: dict) -> str:
 
 def run(folder: Path, names: tuple[str, ...] | None = None, tile_px: float | None = None, threshold: float = 0.5,
         name_threshold: float = 0.6, labels: bool = True, show_floor: bool = False, pick: bool = False,
-        fps: float = 30, device: str = "auto", store: Path = STORE, backend: str = "auto") -> None:
+        fps: float = 30, device: str = "auto", store: Path = STORE, backend: str = "auto",
+        view_mode: str = "auto") -> None:
     """backend: "coreml" runs the model on the Neural Engine (exported for the
     game view's size the first time, then cached), "torch" on the GPU/CPU,
-    "auto" Core ML when coremltools is installed."""
+    "auto" Core ML when coremltools is installed. view_mode: "auto" finds the
+    game view (view.py), "manual" uses the hand-picked area (pick drags a new one)."""
     try:
         import AppKit
         import cv2
@@ -264,6 +269,7 @@ def run(folder: Path, names: tuple[str, ...] | None = None, tile_px: float | Non
         raise SystemExit('the overlay needs macOS and: pip install -e ".[live]"') from exc
     import torch
 
+    from . import view as V
     from .detect import CELL
     from .predict import MOB_COLOURS, _names, _tensor, _to_model, floor_guesses, guesses_fast, load_detect_model
 
@@ -298,10 +304,40 @@ def run(folder: Path, names: tuple[str, ...] | None = None, tile_px: float | Non
     print(f"overlay: following window {win.wid} ({win.owner!r}, {win.w:.0f}x{win.h:.0f} points); "
           f"model {folder.name}, {engine_name}. Ctrl-C or Quit in the panel stops it.", flush=True)
 
+    screens = [(s.frame().origin.x, s.frame().origin.y, s.frame().size.width, s.frame().size.height)
+               for s in AppKit.NSScreen.screens()]
+
+    def backing_scale(w: Window) -> float:
+        # The screen the window's centre is on (Cocoa's y is up from the primary screen's bottom).
+        cx, cy = w.x + w.w / 2, screens[0][3] - (w.y + w.h / 2)
+        for s in AppKit.NSScreen.screens():
+            f = s.frame()
+            if f.origin.x <= cx < f.origin.x + f.size.width and f.origin.y <= cy < f.origin.y + f.size.height:
+                return float(s.backingScaleFactor())
+        return float(AppKit.NSScreen.mainScreen().backingScaleFactor())
+
+    def client_area(w: Window) -> Area:
+        top = V.title_bar(w.x, w.y, w.w, w.h, screens) / max(w.h, 1.0)
+        return Area(0.0, top, 1.0, 1.0 - top)
+
+    config = next(iter(V.config_paths()), None)
+    settings = V.read_settings(config)
+    tracker = V.ViewTracker(settings, backing_scale(win))
+    view_mode = "manual" if pick else view_mode
+    print(f"overlay: game view {view_mode}; client settings "
+          + (f"from {config} ({settings.layout} layout, "
+             + (f"fixed scale {settings.fixed_scale}" if not settings.stretch else "stretched")
+             + f", UI scale {settings.ui_scale or 'auto'})" if config else "not found, using the defaults"), flush=True)
+
     state = {"win": win, "area": load_area(store) or default_area(win), "paused": False, "labels": labels,
              "floor": show_floor, "threshold": threshold, "tile_px": tile_px, "fixed_tile": tile_px is not None,
-             "cap_size": None, "result": Result(note="starting"), "stop": False, "picking": pick}
+             "cap_size": None, "result": Result(note="starting"), "stop": False, "picking": pick, "view": view_mode}
     lock = threading.Lock()
+
+    def area_for(w: Window) -> Area:
+        """What is captured and drawn over: the client area in auto mode (the
+        world is found inside it), the hand-picked area in manual mode."""
+        return client_area(w) if state["view"] == "auto" else state["area"]
 
     def worker():
         try:
@@ -328,7 +364,7 @@ def run(folder: Path, names: tuple[str, ...] | None = None, tile_px: float | Non
                 continue
             t0 = time.time()
             # Only the game view, one pixel per point: the model works at 32 px a tile anyway.
-            shot = capture_window(Quartz, w.wid, state["area"].points(w), nominal=True)
+            shot = capture_window(Quartz, w.wid, area_for(w).points(w), nominal=True)
             if shot is None:
                 continue
             with ready:
@@ -353,6 +389,72 @@ def run(folder: Path, names: tuple[str, ...] | None = None, tile_px: float | Non
         x = frame[:, :, ::-1].astype(np.float32).transpose(2, 0, 1)[None] / 255
         return engines[size](x)
 
+    def manual_tile(view: np.ndarray, px_per_point: float) -> None:
+        retry = state.get("tile_source") in ("saved", "default") and time.time() - state.get("tile_tried", 0) > 3
+        if not state["fixed_tile"] and (state["tile_px"] is None or state["cap_size"] != view.shape[:2] or retry):
+            # The floor's grid gives the tile size at any zoom. While it can't be measured (a dark
+            # view), use the last measured size, else the default zoom (21x15 tiles), and try again.
+            state["tile_tried"] = time.time()
+            grid = tile_from_grid(cv2.cvtColor(view, cv2.COLOR_BGR2GRAY))
+            saved = load_tile_points(store)
+            if grid:
+                tile, source = grid, "grid"
+                save_tile_points(grid / px_per_point, store)
+            elif saved:
+                tile, source = saved * px_per_point, "saved"
+            else:
+                tile, source = tile_from_view(view.shape[1], view.shape[0]), "default"
+            changed = state["tile_px"] != tile or state["cap_size"] != view.shape[:2]
+            state["tile_px"], state["tile_source"], state["cap_size"] = tile, source, view.shape[:2]
+            if changed:
+                print(f"overlay: game view {view.shape[1]}x{view.shape[0]} px, one tile = {tile:.0f} px ({source}; "
+                      "Tile size in the panel, or --tile-px, to change it)", flush=True)
+                AppKit.NSOperationQueue.mainQueue().addOperationWithBlock_(lambda: sync_tile_slider())
+
+    auto = {"players": [], "boxes": [], "phase": None, "est": None}
+
+    def auto_crop(view: np.ndarray, now: float) -> tuple[np.ndarray, int, int, float]:
+        """Auto mode: (re-)work out the game view now and then, then cut out
+        whole tiles starting on the floor's tile lines. Returns the model's
+        picture, where it starts in the capture and the tile size."""
+        size = (view.shape[1], view.shape[0])
+        est = auto["est"]
+        keep_out = None
+        if est is not None:
+            cx, cy = est.world.centre
+            keep_out = V.Rect(cx - 1.5 * est.tile, cy - 1.5 * est.tile, 3 * est.tile, 3 * est.tile)
+        tracker.still.observe(view, now, keep_out)
+        if tracker.due(size, now):
+            changed = est is None or tracker.size != size
+            est = tracker.estimate(view, auto["players"], now)
+            if changed or est.world != auto["est"].world or est.tile != auto["est"].tile:
+                x, y, ww, hh = est.world.ints()
+                print(f"overlay: auto game view {ww}x{hh} at {x},{y} (points in the window's client area), one tile "
+                      f"= {est.tile:.1f} px; {est.source}, confidence {est.confidence:.0%}"
+                      + (f"; {est.note}" if est.note else ""), flush=True)
+            auto["est"] = est
+            if not state["fixed_tile"]:
+                state["tile_px"], state["tile_source"] = est.tile, "auto"
+                AppKit.NSOperationQueue.mainQueue().addOperationWithBlock_(lambda: sync_tile_slider())
+        tile = state["tile_px"] or est.tile
+        world = est.world
+        x, y, ww, hh = world.ints()
+        grey = cv2.cvtColor(view[y:y + hh, x:x + ww], cv2.COLOR_BGR2GRAY)
+        cols_p, rows_p = V.edge_profiles(grey)
+        px, py = V.phase_from_boxes(auto["boxes"], tile)
+        last = auto["phase"] or (None, None)
+        phase = []
+        for prof, prefer, origin, prev in ((cols_p, px, x, last[0]), (rows_p, py, y, last[1])):
+            p = V.grid_phase(prof, tile, None if prefer is None else (prefer - origin) % tile)
+            if p is not None:
+                phase.append(p + origin)
+            else:                               # a dark view: where the things are, else where the lines were
+                phase.append(prefer if prefer is not None else prev if prev is not None else float(origin))
+        auto["phase"] = tuple(phase)
+        cx0, cy0, cw, ch, cols, rows = V.tile_crop(world, tile, *phase)
+        crop = V.cut(view, world, cx0, cy0, cw, ch)
+        return cv2.resize(crop, (cols * CELL, rows * CELL), interpolation=cv2.INTER_AREA), cx0, cy0, tile
+
     def work():
         seen = 0
         frames, t_rate, rate, t_status = 0, time.time(), 0.0, 0.0
@@ -365,34 +467,38 @@ def run(folder: Path, names: tuple[str, ...] | None = None, tile_px: float | Non
             view = shot
             if view.shape[0] < 2 * CELL or view.shape[1] < 2 * CELL:
                 continue
-            px_per_point = view.shape[1] / max(1.0, state["area"].fw * w.w)
-            retry = state.get("tile_source") in ("saved", "default") and time.time() - state.get("tile_tried", 0) > 3
-            if not state["fixed_tile"] and (state["tile_px"] is None or state["cap_size"] != view.shape[:2] or retry):
-                # The floor's grid gives the tile size at any zoom. While it can't be measured (a dark
-                # view), use the last measured size, else the default zoom (21x15 tiles), and try again.
-                state["tile_tried"] = time.time()
-                grid = tile_from_grid(cv2.cvtColor(view, cv2.COLOR_BGR2GRAY))
-                saved = load_tile_points(store)
-                if grid:
-                    tile, source = grid, "grid"
-                    save_tile_points(grid / px_per_point, store)
-                elif saved:
-                    tile, source = saved * px_per_point, "saved"
-                else:
-                    tile, source = tile_from_view(view.shape[1], view.shape[0]), "default"
-                changed = state["tile_px"] != tile or state["cap_size"] != view.shape[:2]
-                state["tile_px"], state["tile_source"], state["cap_size"] = tile, source, view.shape[:2]
-                if changed:
-                    print(f"overlay: game view {view.shape[1]}x{view.shape[0]} px, one tile = {tile:.0f} px ({source}; "
-                          "Tile size in the panel, or --tile-px, to change it)", flush=True)
-                    AppKit.NSOperationQueue.mainQueue().addOperationWithBlock_(lambda: sync_tile_slider())
+            px_per_point = view.shape[1] / max(1.0, area_for(w).fw * w.w)
+            is_auto = state["view"] == "auto"
             t0 = time.time()
-            frame = _to_model(view, state["tile_px"], cv2)
+            if is_auto:
+                frame, ox, oy, tile = auto_crop(view, t0)
+            else:
+                manual_tile(view, px_per_point)
+                t0 = time.time()
+                frame, ox, oy, tile = _to_model(view, state["tile_px"], cv2), 0, 0, state["tile_px"]
             t1 = time.time()
             out = run_model(frame)
             t2 = time.time()
             found = guesses_fast(model, word, out, state["threshold"], all_t=all_t, scale=scale, bias=bias)
             floor = floor_guesses(model, out) if state["floor"] else None
+            dropped = 0
+            if is_auto:
+                # Boxes in the capture; drop the ones under the HUD; remember players and boxes for the next checks.
+                k = tile / CELL
+                est = auto["est"]
+                kept, boxes, players = [], [], []
+                for g in found:
+                    x0, y0, x1, y1 = (g.box[0] * k + ox, g.box[1] * k + oy, g.box[2] * k + ox, g.box[3] * k + oy)
+                    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+                    if not V.keep_detection(cx, cy, est.hud):
+                        dropped += 1
+                        continue
+                    kept.append(g)
+                    if g.slot == 0:
+                        boxes.append((x0, y0, x1, y1, g.score))
+                    if g.player >= 0.5:
+                        players.append((cx, cy))
+                found, auto["boxes"], auto["players"] = kept, boxes, players
             t3 = time.time()
             frames += 1
             now = time.time()
@@ -401,15 +507,25 @@ def run(folder: Path, names: tuple[str, ...] | None = None, tile_px: float | Non
             ms = {"capture": round(cap_ms, 1), "resize": round((t1 - t0) * 1000, 1),
                   "model": round((t2 - t1) * 1000, 1), "names": round((t3 - t2) * 1000, 1)}
             with lock:
-                state["result"] = Result(found, floor[0] if floor else None, state["tile_px"], px_per_point,
-                                         (t3 - t0) * 1000, rate, view=view)
+                state["result"] = Result(found, floor[0] if floor else None, tile, px_per_point,
+                                         (t3 - t0) * 1000, rate, view=view,
+                                         offset=(ox / px_per_point, oy / px_per_point))
                 state["ms"] = ms
             if now - t_status >= 1:
                 t_status = now
-                print(status_line({"fps": round(rate, 1), "ms": ms, "engine": engine_name, "window": True,
-                                   "tile_px": state["tile_px"], "tile_source": state.get("tile_source", "manual"),
-                                   "input": list(frame.shape[:2]),
-                                   "things": len(found)}), flush=True)
+                status = {"fps": round(rate, 1), "ms": ms, "engine": engine_name, "window": True,
+                          "tile_px": round(tile, 2), "tile_source": state.get("tile_source", "manual"),
+                          "input": list(frame.shape[:2]), "things": len(found)}
+                if is_auto:
+                    est = auto["est"]
+                    x, y, ww, hh = est.world.scaled(1 / px_per_point).ints()
+                    status["view"] = {"mode": "auto", "source": est.source, "confidence": est.confidence,
+                                      "rect_pt": [x, y, ww, hh], "tile_pt": round(est.tile / px_per_point, 2),
+                                      "zoom": est.zoom, "hud_boxes": len(est.hud), "hud_dropped": dropped,
+                                      "note": est.note}
+                else:
+                    status["view"] = {"mode": "manual"}
+                print(status_line(status), flush=True)
 
     primary_h = AppKit.NSScreen.screens()[0].frame().size.height
 
@@ -442,16 +558,17 @@ def run(folder: Path, names: tuple[str, ...] | None = None, tile_px: float | Non
             if not res.tile_px:
                 _text(res.note, 6, 6, (0, 1, 0), 12)
                 return
-            k = lambda b: model_to_view(b, res.tile_px, res.px_per_point, CELL)
+            ox, oy = res.offset
+            k = lambda b: tuple(v + (ox, oy)[i % 2] for i, v in enumerate(model_to_view(b, res.tile_px, res.px_per_point, CELL)))
             if res.floor is not None:
                 cell_pt = res.tile_px / res.px_per_point
                 for (r, c), _gases in res.floor.gas.items():
                     AppKit.NSColor.colorWithCalibratedRed_green_blue_alpha_(0.8, 0, 0.8, 0.25).set()
-                    AppKit.NSRectFillUsingOperation(AppKit.NSMakeRect(c * cell_pt, r * cell_pt, cell_pt, cell_pt),
+                    AppKit.NSRectFillUsingOperation(AppKit.NSMakeRect(ox + c * cell_pt, oy + r * cell_pt, cell_pt, cell_pt),
                                                     AppKit.NSCompositingOperationSourceOver)
                 for r, row in enumerate(res.floor.tiles):
                     for c, tile in enumerate(row):
-                        _text(tile[:10], c * cell_pt + 1, (r + 1) * cell_pt - 10, (0.75, 0.75, 0.75), 7)
+                        _text(tile[:10], ox + c * cell_pt + 1, oy + (r + 1) * cell_pt - 10, (0.75, 0.75, 0.75), 7)
             for g in res.found:
                 x0, y0, x1, y1 = k(g.box)
                 player = g.player >= 0.5
@@ -555,9 +672,16 @@ def run(folder: Path, names: tuple[str, ...] | None = None, tile_px: float | Non
             tile_label.setStringValue_(f"Tile size {state['tile_px']:.0f} px")
 
         def pick_(self, sender):
+            state["view"] = "manual"            # a hand-picked view replaces the automatic one
+            auto_box.setState_(0)
             state["picking"] = True
             overlay.setIgnoresMouseEvents_(False)
             view.setNeedsDisplay_(True)
+
+        def auto_(self, sender):
+            state["view"] = "auto" if sender.state() else "manual"
+            state["cap_size"] = None
+            print(f"overlay: game view {state['view']}", flush=True)
 
         def quit_(self, sender):
             state["stop"] = True
@@ -577,7 +701,7 @@ def run(folder: Path, names: tuple[str, ...] | None = None, tile_px: float | Non
                     state["missing_said"] = now
                     print(status_line({"fps": 0, "engine": engine_name, "window": False}), flush=True)
                 return
-            area = Area() if state["picking"] else state["area"]
+            area = Area() if state["picking"] else area_for(w)
             x, y, ww, hh = area.points(w)
             fx, fy, fw, fh = cocoa_frame(x, y, ww, hh, primary_h)
             frame = AppKit.NSMakeRect(fx, fy, fw, fh)
@@ -589,7 +713,7 @@ def run(folder: Path, names: tuple[str, ...] | None = None, tile_px: float | Non
 
     controls = Controls.alloc().init()
     panel = AppKit.NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
-        AppKit.NSMakeRect(40, 80, 230, 236),
+        AppKit.NSMakeRect(40, 80, 230, 260),
         AppKit.NSWindowStyleMaskTitled | AppKit.NSWindowStyleMaskUtilityWindow | AppKit.NSWindowStyleMaskNonactivatingPanel,
         AppKit.NSBackingStoreBuffered, False)
     panel.setTitle_("changeling14 overlay")
@@ -611,7 +735,8 @@ def run(folder: Path, names: tuple[str, ...] | None = None, tile_px: float | Non
         box.addSubview_(b)
         return b
 
-    button("Pause", "pause:", 202)
+    button("Pause", "pause:", 226)
+    auto_box = button("Auto game view", "auto:", 200, AppKit.NSButtonTypeSwitch, view_mode == "auto")
     button("Labels", "labels:", 176, AppKit.NSButtonTypeSwitch, labels)
     button("Floor tiles and gas", "floor:", 152, AppKit.NSButtonTypeSwitch, show_floor)
     tile_label = AppKit.NSTextField.labelWithString_("Tile size: working it out")
