@@ -135,7 +135,9 @@ def test_tracker_default_layout_with_the_hud_over_the_world():
     # Zoomed in one step: the grid shows 120 px tiles; the view box stays the same.
     zoomed = _world(813, 1470, 120, phase=(5, 5))
     est = tr.estimate(zoomed, [(735, 406)], now=10)
-    est = tr.estimate(zoomed, [(735, 406)], now=20)             # a change is confirmed by a second look
+    assert est.tile == 80                                       # one look at a zoom isn't enough
+    for t in (20, 30):                                          # the zoom is seen again, then confirmed
+        est = tr.estimate(zoomed, [(735, 406)], now=t)
     assert abs(est.tile - 120) < 0.5 and abs(est.zoom - 1 / 1.5) < 1e-3 and "zoom" in est.source
     # Every zoom the game allows (zoomed in: bigger tiles; a ghost zoomed out: smaller).
     import cv2

@@ -490,7 +490,7 @@ def run(folder: Path, names: tuple[str, ...] | None = None, tile_px: float | Non
                 for g in found:
                     x0, y0, x1, y1 = (g.box[0] * k + ox, g.box[1] * k + oy, g.box[2] * k + ox, g.box[3] * k + oy)
                     cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
-                    if not V.keep_detection(cx, cy, est.hud):
+                    if not est.world.contains(cx, cy) or not V.keep_detection(cx, cy, est.hud):
                         dropped += 1
                         continue
                     kept.append(g)

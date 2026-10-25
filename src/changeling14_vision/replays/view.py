@@ -501,6 +501,7 @@ class ViewTracker:
         self.last_time = 0.0
         self.size: tuple[int, int] | None = None
         self.still = StillPixels()
+        self.last_zoom: float | None = None
 
     def due(self, size: tuple[int, int], now: float) -> bool:
         return self.current is None or size != self.size or now - self.last_time >= self.every
@@ -556,17 +557,34 @@ class ViewTracker:
             else:
                 conf -= 0.25
                 notes.append("letterbox bars aren't black (settings out of date?)")
-        # The floor grid: confirms the tile size, or shows the eye is zoomed.
+        # Menus: the layout's boxes plus anything seen standing still while the world moved.
+        hud_area = Rect(0, 0, w, h).scaled(self.backing) if self.s.layout != "separated" else \
+            ctrl.scaled(self.backing)
+        menus = [r.scaled(1 / self.backing) for r in hud_rects(hud_area, self.s, self.ui_scale)]
+        moving = self.still.boxes()
+        if moving:
+            source.append("still-menus")
+        menus += moving
+        # The floor grid: confirms the tile size, or shows the eye is zoomed. Menus are blanked
+        # first: rows of buttons repeat too.
         x, y, ww, hh = world.ints()
+        floor = grey[y:y + hh, x:x + ww].copy()
+        for r in menus:
+            rx, ry, rw, rh = r.moved(-x, -y).ints()
+            floor[max(0, ry):max(0, ry + rh), max(0, rx):max(0, rx + rw)] = 0
         # Only the sizes the game can show are tried: the settings' tile at each eye zoom.
         if tile_hint:
             grid = tile_hint
         else:
-            grid, scores = tile_from_candidates(grey[y:y + hh, x:x + ww], [tile_cfg / z for z in ZOOMS])
+            grid, scores = tile_from_candidates(floor, [tile_cfg / z for z in ZOOMS])
             # Another zoom only when its repeat is clearly sharper than the settings' tile's.
             if grid and abs(grid - tile_cfg) > 0.5 and scores[grid] < 1.3 * scores.get(tile_cfg, 0.0):
                 grid = None
         checks["tile_settings"], checks["tile_grid"] = round(tile_cfg, 2), grid and round(grid, 2)
+        # A zoom is used only once two checks in a row agree on it (the first look included).
+        seen_zoom = round(tile_cfg / grid, 3) if grid else None
+        level_seen = min(ZOOMS, key=lambda z: abs(seen_zoom / z - 1)) if seen_zoom else None
+        self.last_zoom, previous_zoom = level_seen, self.last_zoom
         tile, zoom = tile_cfg, 1.0
         if grid:
             ratio = tile_cfg / grid
@@ -574,10 +592,12 @@ class ViewTracker:
             if abs(ratio - 1) <= 0.05:
                 source.append("grid")
                 conf += 0.2
-            elif abs(ratio / level - 1) <= 0.05:
+            elif abs(ratio / level - 1) <= 0.05 and previous_zoom == level:
                 tile, zoom = tile_cfg / level, level
                 source.append(f"grid (zoom {level:g})")
                 conf += 0.1
+            elif abs(ratio / level - 1) <= 0.05:
+                notes.append(f"floor grid looks like zoom {level:g}; checking again before using it")
             else:
                 notes.append(f"floor grid says {grid:.0f} px a tile, not a zoom the game has; kept {tile_cfg:.0f}")
         else:
@@ -598,16 +618,9 @@ class ViewTracker:
             conf -= 0.15
             notes = [n for n in notes if not n.startswith("no floor grid")]
             notes.append("no game world recognised: no floor grid, no player (lobby, a menu or a dark view)")
-        # Menus: the layout's boxes plus anything seen standing still while the world moved.
-        hud_area = Rect(0, 0, w, h).scaled(self.backing) if self.s.layout != "separated" else \
-            ctrl.scaled(self.backing)
-        hud = [r.scaled(1 / self.backing) for r in hud_rects(hud_area, self.s, self.ui_scale)]
-        moving = self.still.boxes()
-        if moving:
-            source.append("still-menus")
         # A quarter tile of margin: a thing whose box centre is just off a menu is usually the menu's edge.
         pad = 0.25 * tile
-        hud = [Rect(r.x - pad, r.y - pad, r.w + 2 * pad, r.h + 2 * pad).intersect(world) for r in hud + moving]
+        hud = [Rect(r.x - pad, r.y - pad, r.w + 2 * pad, r.h + 2 * pad).intersect(world) for r in menus]
         hud = [r for r in hud if r.w > 0 and r.h > 0]
         est = ViewEstimate(world, tile, hud, "+".join(source), round(max(0.0, min(1.0, conf)), 2),
                            "; ".join(notes), round(zoom, 3), checks)
