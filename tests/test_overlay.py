@@ -53,3 +53,15 @@ def test_tile_size_from_the_floor_grid():
     g[::80, :] = 30
     assert ov.tile_from_grid(g) == 80
     assert ov.tile_from_grid(np.zeros((600, 1200), np.uint8)) is None
+
+
+def test_tile_store_keeps_the_area_and_dark_views_give_no_grid(tmp_path):
+    store = tmp_path / "overlay.json"
+    ov.save_area(ov.Area(0.1, 0.2, 0.5, 0.6), store)
+    ov.save_tile_points(80, store)
+    assert ov.load_area(store) == ov.Area(0.1, 0.2, 0.5, 0.6) and ov.load_tile_points(store) == 80
+    ov.save_area(ov.Area(0, 0, 1, 1), store)                  # saving the area keeps the tile size
+    assert ov.load_tile_points(store) == 80
+    dark = np.random.default_rng(0).integers(0, 8, (600, 900)).astype(np.uint8)
+    assert ov.tile_from_grid(dark) is None
+    assert ov.status_line({"fps": 12.5}).startswith('STATUS {"fps":12.5')

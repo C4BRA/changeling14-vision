@@ -26,6 +26,7 @@ live = [
     "opencv-python>=4.9",
     "pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'",
     "pyobjc-framework-Cocoa>=10.0; sys_platform == 'darwin'",
+    "coremltools>=8.0; sys_platform == 'darwin'",
 ]
 text = [
     "sentence-transformers>=3.0",

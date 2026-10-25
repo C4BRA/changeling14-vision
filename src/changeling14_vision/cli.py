@@ -309,7 +309,27 @@ def cmd_replays_overlay(args) -> int:
 
     names = tuple(n.strip() for n in args.window_name.split(",") if n.strip()) if args.window_name else None
     run(_replay_model(args), names, args.tile_px, args.threshold, args.name_threshold, not args.no_labels,
-        args.floor, args.pick, args.fps, args.device)
+        args.floor, args.pick, args.fps, args.device, backend=args.backend)
+    return 0
+
+
+def cmd_replays_coreml(args) -> int:
+    from .replays import coreml
+
+    try:
+        h, w = (int(v) for v in args.size.lower().split("x"))
+    except ValueError:
+        print("--size is HEIGHTxWIDTH in model pixels, e.g. 288x320", flush=True)
+        return 1
+    folder = _replay_model(args)
+    path = coreml.export(folder, h, w)
+    plan = coreml.placement(path)
+    print(f"coreml: {path}\ncoreml: operations by device: {plan['devices']}"
+          + (f"; not on the Neural Engine: {plan['not_on_neural_engine']}" if plan["not_on_neural_engine"] else ""),
+          flush=True)
+    if args.check:
+        frames = sorted(Path(args.check).expanduser().rglob("*.png"))[:: max(1, len(list(Path(args.check).expanduser().rglob("*.png"))) // 40)][:40]
+        print("coreml: check against PyTorch:", json.dumps(coreml.check(folder, path, frames)), flush=True)
     return 0
 
 
@@ -474,11 +494,22 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--threshold", type=float, default=0.5, help="how sure a square must be to count (default 0.5)")
     r.add_argument("--name-threshold", type=float, default=0.6,
                    help='show "?" instead of a name the model is less sure of (default 0.6)')
-    r.add_argument("--fps", type=float, default=15, help="pictures per second at most (default 15)")
+    r.add_argument("--fps", type=float, default=30, help="pictures per second at most (default 30)")
     r.add_argument("--no-labels", action="store_true", help="boxes only")
     r.add_argument("--floor", action="store_true", help="also show each square's floor tile and tint gas")
     r.add_argument("--device", default="auto", help="auto, mps, cuda or cpu (default auto)")
+    r.add_argument("--backend", default="auto", choices=["auto", "coreml", "torch"],
+                   help="coreml: the Neural Engine (exported once per game-view size); torch: GPU/CPU; "
+                        "auto: coreml if coremltools is installed (default)")
     r.set_defaults(func=cmd_replays_overlay)
+    r = rsub.add_parser("coreml", help="export a replay model to Core ML for the Neural Engine (macOS)")
+    r.add_argument("model", help="replay model folder name (inside --models) or path")
+    r.add_argument("--models", default=DEFAULT_MODELS, help=f"models folder (default {DEFAULT_MODELS})")
+    r.add_argument("--size", default="288x320",
+                   help="model input HEIGHTxWIDTH in model pixels, multiples of 32 (the overlay exports the size "
+                        "it needs by itself; default 288x320)")
+    r.add_argument("--check", metavar="FRAMES_DIR", help="compare with PyTorch on PNG frames in this folder")
+    r.set_defaults(func=cmd_replays_coreml)
 
     args = parser.parse_args(argv)
     return args.func(args)

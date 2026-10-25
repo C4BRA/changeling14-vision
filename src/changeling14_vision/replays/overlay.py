@@ -123,6 +123,8 @@ def tile_from_grid(grey: np.ndarray, lo: int = 24, hi: int = 220) -> float | Non
     """Pixels per tile from the floor's grid: the strongest repeat of edge
     strength across the view (columns, then rows). None if nothing repeats
     clearly, e.g. a mostly dark view."""
+    if grey.mean() < 12:                  # mostly dark: no floor grid to measure
+        return None
     best = None
     for axis in (1, 0):
         d = np.abs(np.diff(grey.astype(np.float32), axis=axis)).mean(axis=1 - axis)
@@ -136,9 +138,31 @@ def tile_from_grid(grey: np.ndarray, lo: int = 24, hi: int = 220) -> float | Non
         # repeat as strongly as a whole one: step up while the double is nearly as strong.
         while 2 * k < min(hi, len(ac)) and ac[2 * k] >= 0.85 * ac[k]:
             k *= 2
-        if ac[k] >= 0.25 and (best is None or ac[k] > best[1]):
+        if k > lo and ac[k] >= 0.3 and (best is None or ac[k] > best[1]):
             best = (float(k), float(ac[k]))
     return best[0] if best else None
+
+
+def load_tile_points(store: Path = STORE) -> float | None:
+    """The last tile size measured from the floor grid, in screen points."""
+    try:
+        v = float(json.loads(Path(store).expanduser().read_text()).get("tile_pt"))
+        return v if v > 0 else None
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
+def save_tile_points(tile_pt: float, store: Path = STORE) -> None:
+    path = Path(store).expanduser()
+    try:
+        d = json.loads(path.read_text())
+    except (OSError, ValueError):
+        d = {}
+    d["tile_pt"] = round(float(tile_pt), 2)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(d, indent=2))
+    os.replace(tmp, path)
 
 
 def load_area(store: Path = STORE) -> Area | None:
@@ -152,8 +176,13 @@ def load_area(store: Path = STORE) -> Area | None:
 def save_area(area: Area, store: Path = STORE) -> None:
     path = Path(store).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        d = json.loads(path.read_text())
+    except (OSError, ValueError):
+        d = {}
+    d.update({"fx": area.fx, "fy": area.fy, "fw": area.fw, "fh": area.fh})
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps({"fx": area.fx, "fy": area.fy, "fw": area.fw, "fh": area.fh}, indent=2))
+    tmp.write_text(json.dumps(d, indent=2))
     os.replace(tmp, path)
 
 
@@ -196,10 +225,14 @@ class Result:
     view: object = None                             # the captured game view this result belongs to
 
 
-def capture_window(Quartz, wid: int) -> np.ndarray | None:
-    """The window's own pixels as BGR (H, W, 3), Retina pixels, or None."""
-    img = Quartz.CGWindowListCreateImage(Quartz.CGRectNull, Quartz.kCGWindowListOptionIncludingWindow, wid,
-                                         Quartz.kCGWindowImageBoundsIgnoreFraming)
+def capture_window(Quartz, wid: int, rect: tuple[float, float, float, float] | None = None,
+                   nominal: bool = False) -> np.ndarray | None:
+    """The window's own pixels as BGR (H, W, 3), or None. rect (left, top,
+    width, height in screen points) captures only that part of it; nominal
+    captures one pixel per point instead of the Retina two."""
+    bounds = Quartz.CGRectNull if rect is None else Quartz.CGRectMake(*rect)
+    opts = Quartz.kCGWindowImageBoundsIgnoreFraming | (Quartz.kCGWindowImageNominalResolution if nominal else 0)
+    img = Quartz.CGWindowListCreateImage(bounds, Quartz.kCGWindowListOptionIncludingWindow, wid, opts)
     if img is None:
         return None
     w, h = Quartz.CGImageGetWidth(img), Quartz.CGImageGetHeight(img)
@@ -211,9 +244,17 @@ def capture_window(Quartz, wid: int) -> np.ndarray | None:
     return np.ascontiguousarray(a[:, :, :3])        # BGRA (little-endian, alpha first) -> BGR
 
 
+def status_line(d: dict) -> str:
+    """One line for whoever runs the overlay (the app reads these)."""
+    return "STATUS " + json.dumps(d, separators=(",", ":"))
+
+
 def run(folder: Path, names: tuple[str, ...] | None = None, tile_px: float | None = None, threshold: float = 0.5,
         name_threshold: float = 0.6, labels: bool = True, show_floor: bool = False, pick: bool = False,
-        fps: float = 15, device: str = "auto", store: Path = STORE) -> None:
+        fps: float = 30, device: str = "auto", store: Path = STORE, backend: str = "auto") -> None:
+    """backend: "coreml" runs the model on the Neural Engine (exported for the
+    game view's size the first time, then cached), "torch" on the GPU/CPU,
+    "auto" Core ML when coremltools is installed."""
     try:
         import AppKit
         import cv2
@@ -224,8 +265,7 @@ def run(folder: Path, names: tuple[str, ...] | None = None, tile_px: float | Non
     import torch
 
     from .detect import CELL
-    from .predict import MOB_COLOURS, _names, _tensor, _to_model, floor_guesses, guesses, \
-        load_detect_model
+    from .predict import MOB_COLOURS, _names, _tensor, _to_model, floor_guesses, guesses_fast, load_detect_model
 
     if not Quartz.CGPreflightScreenCaptureAccess():
         Quartz.CGRequestScreenCaptureAccess()
@@ -243,11 +283,20 @@ def run(folder: Path, names: tuple[str, ...] | None = None, tile_px: float | Non
     if win is None:
         raise SystemExit(f"no SS14 client window found (looked for {', '.join(names)}); open the game first, "
                          "or pass --window-name")
-    model, table, dev = load_detect_model(folder, device)
+    if backend == "auto":
+        try:
+            import coremltools  # noqa: F401
+            backend = "coreml"
+        except ImportError:
+            backend = "torch"
+    # With Core ML the torch model only supplies the entity texts and naming scale, on the CPU.
+    model, table, dev = load_detect_model(folder, "cpu" if backend == "coreml" else device)
     all_t = model.texts()
+    scale, bias = model.scale.exp().item(), model.bias.item()
     word = _names(table)
+    engine_name = "Neural Engine (Core ML)" if backend == "coreml" else f"PyTorch on {dev}"
     print(f"overlay: following window {win.wid} ({win.owner!r}, {win.w:.0f}x{win.h:.0f} points); "
-          f"model {folder.name} on {dev}. Ctrl-C or Quit in the panel stops it.", flush=True)
+          f"model {folder.name}, {engine_name}. Ctrl-C or Quit in the panel stops it.", flush=True)
 
     state = {"win": win, "area": load_area(store) or default_area(win), "paused": False, "labels": labels,
              "floor": show_floor, "threshold": threshold, "tile_px": tile_px, "fixed_tile": tile_px is not None,
@@ -263,53 +312,104 @@ def run(folder: Path, names: tuple[str, ...] | None = None, tile_px: float | Non
             with lock:
                 state["result"] = Result(note=f"model error: {exc}")
 
-    def work():
+    shared = {"shot": None, "seq": 0, "cap_ms": 0.0}
+    ready = threading.Condition()
+
+    def capturer():
+        """Grabs the game view while the model works on the previous picture."""
         last = 0.0
-        frames, t_rate = 0, time.time()
         while not state["stop"]:
             wait = 1 / fps - (time.time() - last)
             if wait > 0:
                 time.sleep(wait)
             last = time.time()
-            if state["paused"] or state["picking"]:
-                continue
             w = state["win"]
-            if w is None or not w.onscreen:
+            if state["paused"] or state["picking"] or w is None or not w.onscreen:
                 continue
-            shot = capture_window(Quartz, w.wid)
+            t0 = time.time()
+            # Only the game view, one pixel per point: the model works at 32 px a tile anyway.
+            shot = capture_window(Quartz, w.wid, state["area"].points(w), nominal=True)
             if shot is None:
                 continue
-            area = state["area"]
-            x0, y0, x1, y1 = area.pixels(shot.shape[1], shot.shape[0])
-            view = shot[y0:y1, x0:x1]
+            with ready:
+                shared["shot"], shared["win"] = shot, w
+                shared["seq"] += 1
+                shared["cap_ms"] = (time.time() - t0) * 1000
+                ready.notify()
+
+    engines: dict = {}
+
+    def run_model(frame: np.ndarray) -> dict:
+        if backend != "coreml":
+            with torch.no_grad():
+                return model(_tensor(frame, dev))
+        size = frame.shape[:2]
+        if size not in engines:
+            from . import coreml
+            with lock:
+                state["result"] = Result(note=f"converting for the Neural Engine at {size[0]}x{size[1]} (once)")
+            path = coreml.export(folder, *size, log=lambda m: print(m, flush=True))
+            engines[size] = coreml.CoreMLEngine(path, *size)
+        x = frame[:, :, ::-1].astype(np.float32).transpose(2, 0, 1)[None] / 255
+        return engines[size](x)
+
+    def work():
+        seen = 0
+        frames, t_rate, rate, t_status = 0, time.time(), 0.0, 0.0
+        while not state["stop"]:
+            with ready:
+                ready.wait_for(lambda: shared["seq"] != seen or state["stop"], timeout=0.5)
+                if shared["seq"] == seen:
+                    continue
+                seen, shot, w, cap_ms = shared["seq"], shared["shot"], shared["win"], shared["cap_ms"]
+            view = shot
             if view.shape[0] < 2 * CELL or view.shape[1] < 2 * CELL:
                 continue
-            px_per_point = shot.shape[1] / max(1.0, w.w)
-            if not state["fixed_tile"] and (state["tile_px"] is None or state["cap_size"] != view.shape[:2]):
-                # The floor's grid gives the tile size at any zoom; if it doesn't repeat clearly,
-                # assume the default zoom (21x15 tiles). --tile-px or the panel's slider override it.
-                grey = cv2.cvtColor(view, cv2.COLOR_BGR2GRAY)
-                state["tile_px"] = tile_from_grid(grey) or tile_from_view(view.shape[1], view.shape[0])
-                state["cap_size"] = view.shape[:2]
-                print(f"overlay: game view {view.shape[1]}x{view.shape[0]} px, one tile = {state['tile_px']:.0f} px "
-                      "(Tile size in the panel, or --tile-px, to change it)", flush=True)
-                AppKit.NSOperationQueue.mainQueue().addOperationWithBlock_(lambda: sync_tile_slider())
+            px_per_point = view.shape[1] / max(1.0, state["area"].fw * w.w)
+            retry = state.get("tile_source") in ("saved", "default") and time.time() - state.get("tile_tried", 0) > 3
+            if not state["fixed_tile"] and (state["tile_px"] is None or state["cap_size"] != view.shape[:2] or retry):
+                # The floor's grid gives the tile size at any zoom. While it can't be measured (a dark
+                # view), use the last measured size, else the default zoom (21x15 tiles), and try again.
+                state["tile_tried"] = time.time()
+                grid = tile_from_grid(cv2.cvtColor(view, cv2.COLOR_BGR2GRAY))
+                saved = load_tile_points(store)
+                if grid:
+                    tile, source = grid, "grid"
+                    save_tile_points(grid / px_per_point, store)
+                elif saved:
+                    tile, source = saved * px_per_point, "saved"
+                else:
+                    tile, source = tile_from_view(view.shape[1], view.shape[0]), "default"
+                changed = state["tile_px"] != tile or state["cap_size"] != view.shape[:2]
+                state["tile_px"], state["tile_source"], state["cap_size"] = tile, source, view.shape[:2]
+                if changed:
+                    print(f"overlay: game view {view.shape[1]}x{view.shape[0]} px, one tile = {tile:.0f} px ({source}; "
+                          "Tile size in the panel, or --tile-px, to change it)", flush=True)
+                    AppKit.NSOperationQueue.mainQueue().addOperationWithBlock_(lambda: sync_tile_slider())
             t0 = time.time()
             frame = _to_model(view, state["tile_px"], cv2)
-            x = _tensor(frame, dev)
-            with torch.no_grad():
-                out = model(x)
-            found = guesses(model, word, x, state["threshold"], all_t=all_t, out=out)[0]
+            t1 = time.time()
+            out = run_model(frame)
+            t2 = time.time()
+            found = guesses_fast(model, word, out, state["threshold"], all_t=all_t, scale=scale, bias=bias)
             floor = floor_guesses(model, out) if state["floor"] else None
-            ms = (time.time() - t0) * 1000
+            t3 = time.time()
             frames += 1
             now = time.time()
-            rate = frames / max(1e-6, now - t_rate)
-            if now - t_rate > 2:
-                frames, t_rate = 0, now
+            if now - t_rate >= 1:
+                rate, frames, t_rate = frames / (now - t_rate), 0, now
+            ms = {"capture": round(cap_ms, 1), "resize": round((t1 - t0) * 1000, 1),
+                  "model": round((t2 - t1) * 1000, 1), "names": round((t3 - t2) * 1000, 1)}
             with lock:
-                state["result"] = Result(found, floor[0] if floor else None, state["tile_px"], px_per_point, ms,
-                                         rate, view=view)
+                state["result"] = Result(found, floor[0] if floor else None, state["tile_px"], px_per_point,
+                                         (t3 - t0) * 1000, rate, view=view)
+                state["ms"] = ms
+            if now - t_status >= 1:
+                t_status = now
+                print(status_line({"fps": round(rate, 1), "ms": ms, "engine": engine_name, "window": True,
+                                   "tile_px": state["tile_px"], "tile_source": state.get("tile_source", "manual"),
+                                   "input": list(frame.shape[:2]),
+                                   "things": len(found)}), flush=True)
 
     primary_h = AppKit.NSScreen.screens()[0].frame().size.height
 
@@ -371,7 +471,8 @@ def run(folder: Path, names: tuple[str, ...] | None = None, tile_px: float | Non
                     elif player:
                         label = f"player: {label}"
                     _text(label, x0, max(0, y0 - 12), (1, 1, 1), 9, shadow=True)
-            _text(f"{len(res.found)} things, {res.ms:.0f} ms, {res.fps:.0f} fps", 6, 6, (0, 1, 0), 11, shadow=True)
+            _text(f"{len(res.found)} things, {res.fps:.0f} fps, {res.ms:.0f} ms ({engine_name})", 6, 6, (0, 1, 0), 11,
+                  shadow=True)
 
         def mouseDown_(self, e):
             if state["picking"]:
@@ -450,6 +551,7 @@ def run(folder: Path, names: tuple[str, ...] | None = None, tile_px: float | Non
         def tile_(self, sender):
             state["tile_px"] = float(sender.doubleValue())
             state["fixed_tile"] = True
+            state["tile_source"] = "manual"
             tile_label.setStringValue_(f"Tile size {state['tile_px']:.0f} px")
 
         def pick_(self, sender):
@@ -459,6 +561,9 @@ def run(folder: Path, names: tuple[str, ...] | None = None, tile_px: float | Non
 
         def quit_(self, sender):
             state["stop"] = True
+            with ready:
+                ready.notify_all()
+            thread.join(timeout=2)          # let a running Core ML prediction finish before exiting
             app.terminate_(None)
 
         def tick_(self, timer):
@@ -467,6 +572,10 @@ def run(folder: Path, names: tuple[str, ...] | None = None, tile_px: float | Non
             if w is None or not w.onscreen or w.w < MIN_SIZE:
                 if overlay.isVisible():
                     overlay.orderOut_(None)
+                now = time.time()
+                if now - state.get("missing_said", 0) >= 1:
+                    state["missing_said"] = now
+                    print(status_line({"fps": 0, "engine": engine_name, "window": False}), flush=True)
                 return
             area = Area() if state["picking"] else state["area"]
             x, y, ww, hh = area.points(w)
@@ -535,6 +644,7 @@ def run(folder: Path, names: tuple[str, ...] | None = None, tile_px: float | Non
 
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
+    threading.Thread(target=capturer, daemon=True).start()
     if _on_start is not None:
         _on_start({"app": app, "overlay": overlay, "view": view, "panel": panel, "state": state, "lock": lock})
     try:

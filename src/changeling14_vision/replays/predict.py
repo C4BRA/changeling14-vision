@@ -103,6 +103,53 @@ def guesses(model: DetectModel, names: list[str], image: torch.Tensor, threshold
 
 
 @torch.no_grad()
+def guesses_fast(model: DetectModel, names: list[str], out: dict, threshold: float = 0.5, top: int = 3,
+                 all_t: torch.Tensor | None = None, scale: float | None = None, bias: float | None = None) -> list[Guess]:
+    """guesses() for one image, faster: only squares and slots that pass the
+    threshold are compared with the entity texts, the box decoding is
+    vectorised, and only the small result is copied off the device. Same
+    Guess list, in the same order. out may come from the torch model or from
+    the Core ML export (tensors on any device); scale and bias default to the
+    model's."""
+    gh, gw = out["grid"]
+    k = model.slots
+    all_t = model.texts() if all_t is None else all_t
+    dev = all_t.device
+    p = torch.sigmoid(out["something"].reshape(-1).to(dev))
+    cells = torch.nonzero(p > threshold).flatten()
+    if not len(cells):
+        return []
+    more = torch.sigmoid(out["more"].reshape(gh * gw, k - 1).to(dev))[cells]
+    # Slot j shows only if every slot before it did (guesses() breaks at the first miss).
+    ok = torch.ones(len(cells), k, dtype=torch.bool, device=dev)
+    if k > 1:
+        ok[:, 1:] = torch.cumprod((more > threshold).to(torch.int8), dim=1).bool()
+    ci, sj = torch.nonzero(ok, as_tuple=True)                    # cell-major, then slot: guesses()'s order
+    cell = cells[ci]
+    q = out["names"].reshape(gh * gw, k, -1).to(dev)[cell, sj]   # (M, E)
+    s_ = scale if scale is not None else float(model.scale.exp())
+    b_ = bias if bias is not None else float(model.bias)
+    vals, rows = (q @ all_t.T * s_ + b_).topk(top, dim=1)
+    vals = torch.sigmoid(vals)                                   # sigmoid keeps the order, so topk first
+    sure = torch.where(sj == 0, p[cell], more[ci, (sj - 1).clamp(min=0)])
+    box = out["slot_box"].reshape(gh * gw, k, 4).to(dev)[cell, sj]
+    cy, cx = cell // gw, cell % gw
+    x = (cx + box[:, 0]) * CELL
+    y = (cy + box[:, 1]) * CELL
+    w, h = torch.exp(box[:, 2]) * CELL, torch.exp(box[:, 3]) * CELL
+    xyxy = torch.stack([x - w / 2, y - h / 2, x + w / 2, y + h / 2], 1)
+    pl = torch.sigmoid(out["player"].reshape(-1).to(dev))[cell]
+    mob = out["mob"].reshape(gh * gw, -1).to(dev).argmax(1)[cell]
+    xyxy, vals, rows, sure, pl, mob, sj = (t.cpu().tolist() for t in (xyxy, vals, rows, sure, pl, mob, sj))
+    found = []
+    for i in range(len(sj)):
+        top_names = [(names[r], v) for r, v in zip(rows[i], vals[i])]
+        found.append(Guess(tuple(xyxy[i]), top_names[0][0], sure[i], top_names, pl[i],
+                           MOB_CLASSES[mob[i]] if sj[i] == 0 else "none", sj[i]))
+    return found
+
+
+@torch.no_grad()
 def floor_guesses(model: DetectModel, out: dict, threshold: float = 0.5) -> list[FloorGuess] | None:
     """The floor tile, gases and decals the model sees in each square, or None
     for a model without floor heads."""
